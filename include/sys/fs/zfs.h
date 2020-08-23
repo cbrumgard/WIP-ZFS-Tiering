@@ -767,6 +767,7 @@ typedef struct zpool_load_policy {
 #define	VDEV_TYPE_LOG			"log"
 #define	VDEV_TYPE_L2CACHE		"l2cache"
 #define	VDEV_TYPE_INDIRECT		"indirect"
+#define	VDEV_TYPE_TIERING		"teiring"
 
 /* VDEV_TOP_ZAP_* are used in top-level vdev ZAP objects. */
 #define	VDEV_TOP_ZAP_INDIRECT_OBSOLETE_SM \

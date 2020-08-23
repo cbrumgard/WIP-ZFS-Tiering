@@ -1130,7 +1130,21 @@ is_grouping(const char *type, int *mindev, int *maxdev)
 		return (VDEV_TYPE_RAIDZ);
 	}
 
-	if (maxdev != NULL)
+    if (strcmp(type, "tiering") == 0) {
+        /* TODO currently, number of devices must be 2 for tiering.  This can
+         * change later */
+        if (maxdev != NULL) {
+            *maxdev = 2;
+        }
+
+        if (mindev != NULL) {
+            *mindev = 2;
+        }
+
+        return (VDEV_TYPE_TIERING);
+    }
+
+    if (maxdev != NULL)
 		*maxdev = INT_MAX;
 
 	if (strcmp(type, "mirror") == 0) {
@@ -1163,6 +1177,8 @@ is_grouping(const char *type, int *mindev, int *maxdev)
 			*mindev = 1;
 		return (VDEV_TYPE_L2CACHE);
 	}
+
+
 
 	return (NULL);
 }
@@ -1197,8 +1213,8 @@ construct_spec(nvlist_t *props, int argc, char **argv)
 		nv = NULL;
 
 		/*
-		 * If it's a mirror or raidz, the subsequent arguments are
-		 * its leaves -- until we encounter the next mirror or raidz.
+		 * If it's a mirror, tiering or raidz, the subsequent arguments are
+		 * its leaves -- until we encounter the next mirror, tiering, or raidz.
 		 */
 		if ((type = is_grouping(argv[0], &mindev, &maxdev)) != NULL) {
 			nvlist_t **child = NULL;
@@ -1266,7 +1282,8 @@ construct_spec(nvlist_t *props, int argc, char **argv)
 			}
 
 			if (is_log || is_special || is_dedup) {
-				if (strcmp(type, VDEV_TYPE_MIRROR) != 0) {
+				if ((strcmp(type, VDEV_TYPE_MIRROR) != 0) ||
+				    (strcmp(type, VDEV_TYPE_TIERING) != 0)) {
 					(void) fprintf(stderr,
 					    gettext("invalid vdev "
 					    "specification: unsupported '%s' "
