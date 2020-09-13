@@ -257,6 +257,7 @@ SRCS+=	abd.c \
 	vdev_raidz_math_ssse3.c \
 	vdev_removal.c \
 	vdev_root.c \
+	vdev_tiering \
 	vdev_trim.c \
 	zap.c \
 	zap_leaf.c \

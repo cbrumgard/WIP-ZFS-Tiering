@@ -134,6 +134,7 @@ KERNEL_C = \
 	vdev_raidz_math_powerpc_altivec.c \
 	vdev_removal.c \
 	vdev_root.c \
+	vdev_tiering.c \
 	vdev_trim.c \
 	zap.c \
 	zap_leaf.c \

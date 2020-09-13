@@ -197,6 +197,7 @@ static vdev_ops_t *vdev_ops_table[] = {
 	&vdev_missing_ops,
 	&vdev_hole_ops,
 	&vdev_indirect_ops,
+	&vdev_tiering_ops,
 	NULL
 };
 
@@ -208,6 +209,7 @@ vdev_getops(const char *type)
 {
 	vdev_ops_t *ops, **opspp;
 
+	/* TODO this is where tiering fails now */
 	for (opspp = vdev_ops_table; (ops = *opspp) != NULL; opspp++)
 		if (strcmp(ops->vdev_op_type, type) == 0)
 			break;
