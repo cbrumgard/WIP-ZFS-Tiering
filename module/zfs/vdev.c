@@ -1594,6 +1594,26 @@ vdev_uses_zvols(vdev_t *vd)
 	return (B_FALSE);
 }
 
+/*
+ * This function returns true if this or any of the child vdevs require
+ * spa namespace lock during initialization
+ */
+static boolean_t
+vdev_needs_spa_lock(vdev_t *vd) {
+
+    if (vdev_uses_zvols(vd) || vd->vdev_ops == &vdev_tiering_ops) {
+        return B_TRUE;
+    }
+
+    for (int c = 0; c < vd->vdev_children; c++) {
+        if (vdev_needs_spa_lock(vd->vdev_child[c])) {
+            return B_TRUE;
+        }
+    }
+
+    return B_FALSE;
+}
+
 void
 vdev_open_children(vdev_t *vd)
 {
@@ -1605,7 +1625,9 @@ vdev_open_children(vdev_t *vd)
 	 * in a single thread so that the same thread holds the
 	 * spa_namespace_lock
 	 */
-	if (vdev_uses_zvols(vd)) {
+    /* TODO added vdev_needs_spa_lock so that the open call for tiering_vdev
+     * would be in the thread of the spa namespace lock */
+	if (vdev_needs_spa_lock(vd)) {
 retry_sync:
 		for (int c = 0; c < children; c++)
 			vd->vdev_child[c]->vdev_open_error =
