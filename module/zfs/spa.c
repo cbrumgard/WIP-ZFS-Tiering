@@ -7692,6 +7692,242 @@ spa_vdev_resilver_done_hunt(vdev_t *vd)
 	return (NULL);
 }
 
+/* TODO new code for splitting the spa, this is based off of code from
+ * spa_vdev_split_mirror */
+int
+spa_vdev_split_tier(spa_t *spa, char *name, vdev_t *child_vdev) {
+
+    spa_t *newspa = NULL;
+    int error = 0;
+
+
+
+    /* Ensure the namespace lock is held */
+//        mutex_enter(&spa_namespace_lock);
+    ASSERT(MUTEX_HELD(&spa_namespace_lock));
+
+
+    zfs_dbgmsg("Inside of %s@%d", __FUNCTION__, __LINE__);
+
+    /* Check that the new pool doesn't already exist */
+    if (spa_lookup(name) != NULL) {
+        return (SET_ERROR(EINVAL));
+    }
+
+
+    nvlist_t *nvl = NULL;
+//    nvlist_t **child_configs = NULL;
+//    uint_t num_children = 0;
+    //uint64_t tmp_guid;
+   //uint_t child_idx;
+
+
+    zfs_dbgmsg("Inside of %s@%d spa_config = %p", __FUNCTION__, __LINE__, spa->spa_config);
+
+    /* Get the list of child vdev's from spa config */
+//    error = nvlist_lookup_nvlist(spa->spa_config, ZPOOL_CONFIG_VDEV_TREE, &nvl);
+//
+//    nvlist_
+//    if(error != 0) {
+//        zfs_dbgmsg("Inside of %s@%d error = %d", __FUNCTION__, __LINE__);
+//        return error;
+//    }
+//
+//    /* Get the array and size of the array of existing vdev config for
+//     * each child vdev */
+//    error = nvlist_lookup_nvlist_array(nvl, ZPOOL_CONFIG_CHILDREN, &child_configs,
+//                                       &num_children);
+//
+//    if(error != 0) {
+//        zfs_dbgmsg("Inside of %s@%d error = %d", __FUNCTION__, __LINE__);
+//        return error;
+//    }
+//
+//    zfs_dbgmsg("Inside of %s@%d", __FUNCTION__, __LINE__);
+
+
+//    /* Find the child index of the vdev to be split */
+//    for(child_idx = 0; child_idx < num_children; child_idx++) {
+//
+//        tmp_guid = 0;
+//
+//        /* Get the GUID for the child vdev */
+//        error = nvlist_lookup_uint64(child_configs[child_idx], ZPOOL_CONFIG_GUID, &tmp_guid);
+//
+//        if(error != 0) {
+//            zfs_dbgmsg("Inside of %s@%d error = %d tmp_guid = %d", __FUNCTION__, __LINE__, tmp_guid);
+//            return (error = SET_ERROR(EINVAL));
+//        }
+//
+//        /* Skip vdevs not involved. */
+//        if(tmp_guid == child_vdev->vdev_guid) {
+//            zfs_dbgmsg("Inside of %s@%d found the child_vdev", __FUNCTION__, __LINE__);
+//            break;
+//        }
+//    }
+
+
+    /* Retrieve the metadata form the stop level vdev and add it to the
+     * child configs */
+//    VERIFY(nvlist_add_uint64(child_configs[child_idx], ZPOOL_CONFIG_METASLAB_ARRAY,
+//                             child_vdev->vdev_top->vdev_ms_array) == 0);
+//    VERIFY(nvlist_add_uint64(child_configs[child_idx], ZPOOL_CONFIG_METASLAB_SHIFT,
+//                             child_vdev->vdev_top->vdev_ms_shift) == 0);
+//    VERIFY(nvlist_add_uint64(child_configs[child_idx], ZPOOL_CONFIG_ASIZE,
+//                             child_vdev->vdev_top->vdev_asize) == 0);
+//    VERIFY(nvlist_add_uint64(child_configs[child_idx], ZPOOL_CONFIG_ASHIFT,
+//                             child_vdev->vdev_top->vdev_ashift) == 0);
+
+
+    /* Transfer the leaf zap to the child config */
+//    ASSERT3U(child_vdev->vdev_leaf_zap, !=, 0);
+//    VERIFY0(nvlist_add_uint64(child_configs[child_idx],
+//                              ZPOOL_CONFIG_VDEV_LEAF_ZAP,
+//                              child_vdev->vdev_leaf_zap));
+//
+//    /* Transfer the top zap to the child config */
+//    ASSERT3U(child_vdev->vdev_top->vdev_top_zap, !=, 0);
+//    VERIFY0(nvlist_add_uint64(child_configs[child_idx],
+//                              ZPOOL_CONFIG_VDEV_TOP_ZAP,
+//                              child_vdev->vdev_parent->vdev_top_zap));
+
+
+    zfs_dbgmsg("Inside of %s@%d", __FUNCTION__, __LINE__);
+
+    /* Create a new config for the splitting vdev (list of 1 child) and
+     * assign it to the top level spa*/
+    VERIFY(nvlist_alloc(&nvl, NV_UNIQUE_NAME, KM_SLEEP) == 0);
+    VERIFY(nvlist_add_uint64_array(nvl, ZPOOL_CONFIG_SPLIT_LIST,
+                                   &child_vdev->vdev_guid, 1) == 0);
+
+    mutex_enter(&spa->spa_props_lock);
+    VERIFY(nvlist_add_nvlist(spa->spa_config, ZPOOL_CONFIG_SPLIT,
+                             nvl) == 0);
+    mutex_exit(&spa->spa_props_lock);
+    spa->spa_config_splitting = nvl;
+    vdev_config_dirty(spa->spa_root_vdev);
+
+    zfs_dbgmsg("Inside of %s@%d", __FUNCTION__, __LINE__);
+
+    /* Lets create a new config for the pool based on the pervious one */
+
+
+
+
+    nvlist_t *newconfig = NULL;
+    VERIFY(nvlist_alloc(&newconfig, NV_UNIQUE_NAME, KM_SLEEP) == 0);
+
+    zfs_dbgmsg("Inside of %s@%d newconfig = %p", __FUNCTION__, __LINE__, newconfig);
+
+
+
+    /* Set the pool properties */
+    VERIFY(nvlist_add_string(newconfig, ZPOOL_CONFIG_POOL_NAME, name) == 0);
+    VERIFY(nvlist_add_uint64(newconfig, ZPOOL_CONFIG_POOL_STATE, POOL_STATE_ACTIVE) == 0);
+    VERIFY(nvlist_add_uint64(newconfig, ZPOOL_CONFIG_VERSION, spa_version(spa)) == 0);
+    VERIFY(nvlist_add_uint64(newconfig, ZPOOL_CONFIG_POOL_TXG, spa->spa_config_txg) == 0);
+    VERIFY(nvlist_add_uint64(newconfig, ZPOOL_CONFIG_POOL_GUID, spa_generate_guid(NULL)) == 0);
+    VERIFY(nvlist_add_boolean(newconfig, ZPOOL_CONFIG_HAS_PER_VDEV_ZAPS) == 0);
+
+    /* Add in the child vdev */
+    nvlist_t *vdev_tree_config = NULL;
+    nvlist_t *vdev_config[1] = { NULL, };
+
+    VERIFY(nvlist_alloc(&vdev_tree_config, NV_UNIQUE_NAME, KM_SLEEP) == 0);
+
+
+    /* Allocate the config for the single child vdev and fill it in */
+    VERIFY(nvlist_alloc(&vdev_config[0], NV_UNIQUE_NAME, KM_SLEEP) == 0);
+
+    VERIFY(nvlist_add_uint64(vdev_config[0], ZPOOL_CONFIG_IS_HOLE,
+                             0) == 0);
+    VERIFY(nvlist_add_uint64(vdev_config[0], ZPOOL_CONFIG_GUID,
+                             child_vdev->vdev_guid) == 0);
+    VERIFY(nvlist_add_string(vdev_config[0], ZPOOL_CONFIG_TYPE,
+                             VDEV_TYPE_DISK) == 0);
+    VERIFY(nvlist_add_string(vdev_config[0], ZPOOL_CONFIG_PATH,
+                             child_vdev->vdev_path) == 0);
+//    VERIFY(nvlist_add_string(vdev_config[0], ZPOOL_CONFIG_DEVID,
+//                             child_vdev->vdev_devid) == 0);
+//    VERIFY(nvlist_add_string(vdev_config[0], ZPOOL_CONFIG_PHYS_PATH,
+//                             child_vdev->vdev_physpath) == 0);
+//    VERIFY(nvlist_add_string(vdev_config[0], ZPOOL_CONFIG_VDEV_ENC_SYSFS_PATH,
+//                             child_vdev->vdev_enc_sysfs_path) == 0);
+//    VERIFY(nvlist_add_string(vdev_config[0], ZPOOL_CONFIG_FRU,
+//                             child_vdev->vdev_fru) == 0);
+    VERIFY(nvlist_add_uint64(vdev_config[0], ZPOOL_CONFIG_WHOLE_DISK,
+                             child_vdev->vdev_wholedisk) == 0);
+
+    VERIFY(nvlist_add_uint64(vdev_config[0], ZPOOL_CONFIG_CREATE_TXG,
+                             child_vdev->vdev_crtxg) == 0);
+
+
+    VERIFY(nvlist_add_uint64(vdev_config[0], ZPOOL_CONFIG_METASLAB_ARRAY,
+                             child_vdev->vdev_top->vdev_ms_array) == 0);
+    VERIFY(nvlist_add_uint64(vdev_config[0], ZPOOL_CONFIG_METASLAB_SHIFT,
+                             child_vdev->vdev_top->vdev_ms_shift) == 0);
+    VERIFY(nvlist_add_uint64(vdev_config[0], ZPOOL_CONFIG_ASIZE,
+                             child_vdev->vdev_top->vdev_asize) == 0);
+    VERIFY(nvlist_add_uint64(vdev_config[0], ZPOOL_CONFIG_ASHIFT,
+                             child_vdev->vdev_top->vdev_ashift) == 0);
+
+
+    /* Transfer the leaf zap to the child config */
+//    ASSERT3U(child_vdev->vdev_leaf_zap, !=, 0);
+//    VERIFY0(nvlist_add_uint64(vdev_config[0],
+//                              ZPOOL_CONFIG_VDEV_LEAF_ZAP,
+//                              child_vdev->vdev_leaf_zap));
+//
+//    /* Transfer the top zap to the child config */
+//    ASSERT3U(child_vdev->vdev_top->vdev_top_zap, !=, 0);
+//    VERIFY0(nvlist_add_uint64(vdev_config[0],
+//                              ZPOOL_CONFIG_VDEV_TOP_ZAP,
+//                              child_vdev->vdev_parent->vdev_top_zap));
+
+
+    VERIFY(nvlist_add_nvlist_array(vdev_tree_config, ZPOOL_CONFIG_CHILDREN, vdev_config, 1) == 0);
+    VERIFY(nvlist_add_string(vdev_tree_config, ZPOOL_CONFIG_TYPE, VDEV_TYPE_ROOT) == 0);
+
+
+    VERIFY(nvlist_add_nvlist(newconfig, ZPOOL_CONFIG_VDEV_TREE, vdev_tree_config) == 0);
+
+
+    zfs_dbgmsg("Inside of %s@%d", __FUNCTION__, __LINE__);
+
+    newspa = spa_add(name, newconfig, NULL);
+    newspa->spa_avz_action = AVZ_ACTION_REBUILD;
+    newspa->spa_config_txg = spa->spa_config_txg;
+    spa_set_log_state(newspa, SPA_LOG_CLEAR);
+
+    zfs_dbgmsg("Inside of %s@%d", __FUNCTION__, __LINE__);
+
+
+    spa_activate(newspa, spa_mode_global);
+    spa_async_suspend(newspa);
+
+
+
+    zfs_dbgmsg("Inside of %s@%d, number of tasks = %d", __FUNCTION__, __LINE__, spa_async_tasks(newspa));
+
+
+    newspa->spa_config_source = SPA_CONFIG_SRC_SPLIT;
+    newspa->spa_is_splitting = B_TRUE;
+
+
+
+    zfs_dbgmsg("Inside of %s@%d", __FUNCTION__, __LINE__);
+    error = spa_load(newspa, SPA_LOAD_IMPORT, SPA_IMPORT_ASSEMBLE);
+    zfs_dbgmsg("Inside of %s@%d error = %d", __FUNCTION__, __LINE__, error);
+
+    if (error != 0) {
+        return (SET_ERROR(error));
+    }
+
+    /* Return success */
+    return 0;
+}
+
+
 static void
 spa_vdev_resilver_done(spa_t *spa)
 {

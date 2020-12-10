@@ -506,7 +506,6 @@ vdev_tiering_map_free(tiering_map_t *tiering_map) {
     kmem_free(tiering_map, sizeof(tiering_map_t));
 }
 
-
 static int
 vdev_tiering_open(vdev_t *vd, u_int64_t *asize, u_int64_t *max_asize,
                   u_int64_t *ashift)
@@ -522,42 +521,27 @@ vdev_tiering_open(vdev_t *vd, u_int64_t *asize, u_int64_t *max_asize,
         return (SET_ERROR(EINVAL));
     }
 
+    vd->vdev_tsd = NULL;
+
 
     /* TODO new code for splitting the spa, this is based off of code from
-     * spa_vdev_split_mirror */
+    * spa_vdev_split_mirror */
     {
         char name[ZFS_MAX_DATASET_NAME_LEN];
-        spa_t *newspa = NULL;
+//        spa_t *newspa = NULL;
 
         /* Create the name for the pool of the new tier */
         snprintf(name, sizeof(name), "%s-tier0", spa_name(vd->vdev_spa));
 
-        /* Ensure the namespace lock is held */
-//        mutex_enter(&spa_namespace_lock);
-        ASSERT(MUTEX_HELD(&spa_namespace_lock));
 
-        zfs_dbgmsg("Inside of vdev_tiering_open@%d", __LINE__);
+        int error = spa_vdev_split_tier(vd->vdev_spa, name, vd->vdev_child[0]);
 
-        /* Check that the new pool doesn't already exist */
-        if (spa_lookup(name) != NULL) {
-            return (SET_ERROR(EINVAL));
+        if(error) {
+            return (SET_ERROR(error));
         }
 
-        zfs_dbgmsg("Inside of vdev_tiering_open@%d", __LINE__);
-
-
-        newspa = spa_add(name, config, altroot);
-        newspa->spa_avz_action = AVZ_ACTION_REBUILD;
-        newspa->spa_config_txg = vd->vdev_spa->spa_config_txg;
-
-        spa_activate(newspa, spa_mode_global);
-        spa_async_suspend(newspa);
-
 
         zfs_dbgmsg("Inside of vdev_tiering_open@%d", __LINE__);
-
-
-//        mutex_exit(&spa_namespace_lock);
     }
 
 
@@ -585,6 +569,10 @@ vdev_tiering_open(vdev_t *vd, u_int64_t *asize, u_int64_t *max_asize,
         *max_asize = MIN(*max_asize - 1, child_vdev->vdev_max_asize - 1) + 1;
         *ashift = MAX(*ashift, child_vdev->vdev_ashift);
     }
+
+
+
+
 
     /* Create an initialize tiering map */
     tiering_map = vdev_tiering_map_init(vd, vd->vdev_child[0], vd->vdev_child[1]);
@@ -615,19 +603,21 @@ vdev_tiering_close(vdev_t *vd)
     }
 
     /* Stop the vdev tiering thread */
-    mutex_enter(&(tiering_map->tiering_migration_thr_lock));
-    tiering_map->tiering_thread_exit = 1;
-    cv_signal(&(tiering_map->tiering_migration_thr_cv));
-    while(tiering_map->tiering_thread_exit != 0) {
-        cv_wait(&(tiering_map->tiering_migration_thr_cv),
-                &(tiering_map->tiering_migration_thr_lock));
+    if(tiering_map != NULL) {
+        mutex_enter(&(tiering_map->tiering_migration_thr_lock));
+        tiering_map->tiering_thread_exit = 1;
+        cv_signal(&(tiering_map->tiering_migration_thr_cv));
+        while (tiering_map->tiering_thread_exit!=0) {
+            cv_wait(&(tiering_map->tiering_migration_thr_cv),
+                    &(tiering_map->tiering_migration_thr_lock));
+        }
+        mutex_exit(&(tiering_map->tiering_migration_thr_lock));
+
+
+        /* TODO need to decide when to free tiering map, may need to hold if
+         * ops are still underway */
+        vdev_tiering_map_free(tiering_map);
     }
-    mutex_exit(&(tiering_map->tiering_migration_thr_lock));
-
-
-    /* TODO need to decide when to free tiering map, may need to hold if
-     * ops are still underway */
-    vdev_tiering_map_free(vd->vdev_tsd);
 }
 
 static void
@@ -690,7 +680,8 @@ vdev_tiering_io_start(zio_t *zio) {
 
 
     /* TODO remove print statement */
-    //vdev_dbgmsg(zio->io_vd, "Inside of vdev_tiering_io_start, tiering_map = %p", tiering_map);
+    vdev_dbgmsg(zio->io_vd, "Inside of vdev_tiering_io_start, tiering_map = %p", tiering_map);
+
 
     switch(zio->io_type) {
 

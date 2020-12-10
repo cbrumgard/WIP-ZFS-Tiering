@@ -813,6 +813,7 @@ extern int spa_vdev_setpath(spa_t *spa, uint64_t guid, const char *newpath);
 extern int spa_vdev_setfru(spa_t *spa, uint64_t guid, const char *newfru);
 extern int spa_vdev_split_mirror(spa_t *spa, char *newname, nvlist_t *config,
     nvlist_t *props, boolean_t exp);
+extern int spa_vdev_split_tier(spa_t *spa, char *name, vdev_t *child_vdev);
 
 /* spare state (which is global across all pools) */
 extern void spa_spare_add(vdev_t *vd);
