@@ -37,6 +37,8 @@ struct data_range {
     /* Prev writes list */
     list_node_t prev_writes_list_node;
 
+    zio_t *orig_zio;
+
     /* TODO rewrite attempt */
     blkptr_t blkptr;
 };
@@ -515,8 +517,8 @@ vdev_tiering_open(vdev_t *vd, u_int64_t *asize, u_int64_t *max_asize,
     /* TODO remove print statement */
     zfs_dbgmsg("Inside of vdev_tiering_open");
 
-    /* Check that there are two vdevs for tiering */
-    if(vd->vdev_children != 2) {
+    /* Check that there is one vdev for tiering */
+    if(vd->vdev_children != 1) {
         vd->vdev_stat.vs_aux = VDEV_AUX_BAD_LABEL;
         return (SET_ERROR(EINVAL));
     }
@@ -524,25 +526,49 @@ vdev_tiering_open(vdev_t *vd, u_int64_t *asize, u_int64_t *max_asize,
     vd->vdev_tsd = NULL;
 
 
+
+    char name[ZFS_MAX_DATASET_NAME_LEN];
+    spa_t *performance_spa = NULL;
+
+    /* Create the name for the pool of the new tier */
+    snprintf(name, sizeof(name), "%s-tier0", spa_name(vd->vdev_spa));
+
+    ASSERT(MUTEX_HELD(&spa_namespace_lock));
+
+    zfs_dbgmsg("Inside of %s@%d looking for spa %s", __FUNCTION__, __LINE__, name);
+
+    /* Find the performance spa by name */
+    performance_spa = spa_lookup(name);
+
+    /* Spa not found, so report and error */
+    if (performance_spa == NULL) {
+        return (SET_ERROR(EINVAL));
+    }
+
+    zfs_dbgmsg("Inside of %s@%d performance_spa = %p", __FUNCTION__, __LINE__, performance_spa);
+
+
+
+
     /* TODO new code for splitting the spa, this is based off of code from
     * spa_vdev_split_mirror */
-    {
-        char name[ZFS_MAX_DATASET_NAME_LEN];
-//        spa_t *newspa = NULL;
-
-        /* Create the name for the pool of the new tier */
-        snprintf(name, sizeof(name), "%s-tier0", spa_name(vd->vdev_spa));
-
-
-        int error = spa_vdev_split_tier(vd->vdev_spa, name, vd->vdev_child[0]);
-
-        if(error) {
-            return (SET_ERROR(error));
-        }
-
-
-        zfs_dbgmsg("Inside of vdev_tiering_open@%d", __LINE__);
-    }
+//    {
+//        char name[ZFS_MAX_DATASET_NAME_LEN];
+////        spa_t *newspa = NULL;
+//
+//        /* Create the name for the pool of the new tier */
+//        snprintf(name, sizeof(name), "%s-tier0", spa_name(vd->vdev_spa));
+//
+//
+//        int error = spa_vdev_split_tier(vd->vdev_spa, name, vd->vdev_child[0]);
+//
+//        if(error) {
+//            return (SET_ERROR(error));
+//        }
+//
+//
+//        zfs_dbgmsg("Inside of vdev_tiering_open@%d", __LINE__);
+//    }
 
 
     /* Open all of the child vdevs */
@@ -563,6 +589,8 @@ vdev_tiering_open(vdev_t *vd, u_int64_t *asize, u_int64_t *max_asize,
             return child_vdev->vdev_open_error;
         }
 
+
+
         /* Find the mininum asize and ashift settings that will be compatible
          * for the child vdevs and  */
         *asize = MIN(*asize - 1, child_vdev->vdev_asize - 1) + 1;
@@ -570,12 +598,10 @@ vdev_tiering_open(vdev_t *vd, u_int64_t *asize, u_int64_t *max_asize,
         *ashift = MAX(*ashift, child_vdev->vdev_ashift);
     }
 
-
-
-
-
     /* Create an initialize tiering map */
-    tiering_map = vdev_tiering_map_init(vd, vd->vdev_child[0], vd->vdev_child[1]);
+    tiering_map = vdev_tiering_map_init(vd,
+                                        performance_spa->spa_root_vdev,
+                                        vd->vdev_child[0]);
 
     /* Store inside of the vdev private data */
     vd->vdev_tsd = tiering_map;
@@ -583,7 +609,7 @@ vdev_tiering_open(vdev_t *vd, u_int64_t *asize, u_int64_t *max_asize,
 
     /* TODO remove print statement */
     vdev_dbgmsg(vd,"vd = %s fast vd = %s slow vd = %s spa = %p fast spa = %p slow spa = %p",
-            vd->vdev_path, vd->vdev_child[0]->vdev_path, vd->vdev_child[1]->vdev_path, vd->vdev_spa, vd->vdev_child[0]->vdev_spa, vd->vdev_child[1]->vdev_spa);
+            vd->vdev_path, performance_spa->spa_root_vdev->vdev_path, vd->vdev_child[0]->vdev_path, vd->vdev_spa, performance_spa->spa_root_vdev->vdev_spa, vd->vdev_child[0]->vdev_spa);
 
     /* Success if tiering map was created successfully */
     return tiering_map == NULL;
@@ -625,40 +651,43 @@ vdev_tiering_performance_write_child_done(zio_t *zio) {
 
 
     /* TODO remove print statement */
-    //vdev_dbgmsg(zio->io_vd, "Inside of vdev_tiering_performance_write_child_done");
-
+    vdev_dbgmsg(zio->io_spa->spa_root_vdev, "Inside of %s", __FUNCTION__);
 
     /* Get access to the data range entry */
     data_range_t *data_range = zio->io_private;
 
     /* No migration is required */
     if(data_range == NULL) {
-        return;
+        vdev_dbgmsg(zio->io_vd, "Inside of %s, no migration is required", __FUNCTION__);
     }
 
 
-    tiering_map_t *tiering_map = data_range->tiering_map;
-    kmutex_t *lock = &tiering_map->tiering_migration_thr_lock;
-    //kcondvar_t *cv = &tiering_map->tiering_migration_thr_cv;
-
-    /* TODO check for errors on write to performance tier */
+//    zio_execute(zio->io_private);
 
 
 
-    /* TODO see how zio->io_priority works, might be able to modify it to make
-     * this less important */
-
-
-    mutex_enter(lock);
-    list_insert_head(&tiering_map->from_performance_tier_data_ranges, data_range);
-
-
-
-
-    /* TODO temporarily disable signal for demo */
-    //cv_signal(cv);
-
-    mutex_exit(lock);
+//    tiering_map_t *tiering_map = data_range->tiering_map;
+//    kmutex_t *lock = &tiering_map->tiering_migration_thr_lock;
+//    //kcondvar_t *cv = &tiering_map->tiering_migration_thr_cv;
+//
+//    /* TODO check for errors on write to performance tier */
+//
+//
+//
+//    /* TODO see how zio->io_priority works, might be able to modify it to make
+//     * this less important */
+//
+//
+//    mutex_enter(lock);
+//    list_insert_head(&tiering_map->from_performance_tier_data_ranges, data_range);
+//
+//
+//
+//
+//    /* TODO temporarily disable signal for demo */
+//    //cv_signal(cv);
+//
+//    mutex_exit(lock);
 }
 
 
@@ -668,6 +697,34 @@ vdev_tiering_performance_read_child_done(zio_t *zio) {
     //vdev_dbgmsg(zio->io_vd, "Inside of vdev_tiering_performance_read_child_done");
 }
 
+
+
+static void
+vdev_tiering_capacity_allocate_child_done(zio_t *zio) {
+    //vdev_dbgmsg(zio->io_vd, "Inside of %s", __FUNCTION__);
+
+
+    /* Get access to the data range entry */
+    data_range_t *data_range = zio->io_private;
+
+
+    char buf1[256];
+    char buf2[256];
+
+
+    snprintf_blkptr(buf1, sizeof(buf1), &data_range->blkptr);
+    snprintf_blkptr(buf2, sizeof(buf2), zio->io_bp);
+
+
+    vdev_dbgmsg(zio->io_vd, "orig bp = %s", buf1);
+    vdev_dbgmsg(zio->io_vd, "new bp  = %s", buf2);
+}
+
+static void
+vdev_tiering_capacity_read_child_done(zio_t *zio) {
+    vdev_dbgmsg(zio->io_vd, "Inside of %s", __FUNCTION__);
+
+}
 
 static void
 vdev_tiering_io_start(zio_t *zio) {
@@ -687,45 +744,84 @@ vdev_tiering_io_start(zio_t *zio) {
 
         /* Read operation */
         /* TODO Implement read op */
-        case ZIO_TYPE_READ:
-            //vdev_dbgmsg(zio->io_vd, "vdev_tiering_io_start read op offset: %llu length %llu", zio->io_offset, zio->io_size);
+        case ZIO_TYPE_READ: {
+            vdev_dbgmsg(zio->io_vd,
+                        "vdev_tiering_io_start read op offset: %llu length %llu",
+                        zio->io_offset, zio->io_size);
 
             /* TODO currently reads only happen on the slow tier, once we
              * have data migration working then we need to select where to read
              * from */
 
-            if(zio->io_size < 8192) {
-                vd = tiering_map->performance_vdev;
-            } else {
-                vd = tiering_map->capacity_vdev;
-            }
+//            if(zio->io_size < 8192) {
+//                vd = tiering_map->performance_vdev;
+//            } else {
+            vd = tiering_map->capacity_vdev;
+//            }
+//
+            /* Schedule a read on the capacity tier */
+//            zio_nowait(
+//                    zio_vdev_child_io(zio, zio->io_bp, vd,
+//                                      zio->io_offset, zio->io_abd, zio->io_size,
+//                                      zio->io_type, zio->io_priority, 0,
+//                                      vdev_tiering_capacity_read_child_done,
+//                                      tiering_map));
 
-            /* Schedule a read on the fast tier */
-            zio_nowait(
-                    zio_vdev_child_io(zio, zio->io_bp, vd,
-                                      zio->io_offset, zio->io_abd, zio->io_size,
-                                      zio->io_type, zio->io_priority, 0,
-                                      vdev_tiering_performance_read_child_done,
-                                      tiering_map));
+            spa_t *perf_spa = tiering_map->performance_vdev->vdev_spa;
+
+            spa_config_enter(perf_spa, SCL_ALL, FTAG, RW_READER);
+
+            /* Do the read off the physical tier now and fill in the parents
+             * abd buffer */
+            zio_wait(
+                    zio_read_phys(NULL,
+                                  tiering_map->performance_vdev->vdev_child[0],
+                                  zio->io_offset,
+                                  zio->io_size,
+                                  zio->io_abd,
+                                  ZIO_CHECKSUM_OFF,
+                                  vdev_tiering_performance_read_child_done,
+                                  tiering_map,
+                                  zio->io_priority,
+                                  ZIO_FLAG_CANFAIL,
+                                  B_FALSE));
+
+            spa_config_exit(perf_spa, SCL_ALL, FTAG);
+
+
+            /* Create a child nop and use that to signal the parent that it is
+             * done */
+            zio_t * nop_zio = zio_null(zio,
+                                       zio->io_spa,
+                                       vd,
+                                       vdev_tiering_capacity_read_child_done,
+                                       tiering_map,
+                                 ZIO_FLAG_CANFAIL);
+
+
+            zio_add_child(zio, nop_zio);
+
+            zio_nowait(nop_zio);
 
             /* Execute zio */
             zio_execute(zio);
 
+        }
             break;
 
         /* Write operation */
         /* TODO Implement write op */
         case ZIO_TYPE_WRITE: {
 
-//           vdev_dbgmsg(zio->io_vd, "vdev_tiering_io_start write op txg: %d offset: %llu length: %llu flags: %d prev %d",
-//                    zio->io_txg, zio->io_offset, zio->io_size, zio->io_flags, prev_write_found);
+           vdev_dbgmsg(zio->io_vd, "vdev_tiering_io_start write op txg: %d offset: %llu length: %llu flags: %d",
+                    zio->io_txg, zio->io_offset, zio->io_size, zio->io_flags);
 
 
-            /* TODO this is only the base case of a write, need to handle more
-             * complex cases like reslivering and scrubs */
+           /* TODO this is only the base case of a write, need to handle more
+            * complex cases like reslivering and scrubs */
 
-            /* Large writes need a data range to handle migration */
-            if(zio->io_size >= 8192) {
+           /* Large writes need a data range to handle migration */
+           //if(zio->io_size >= 8192) {
 
                 /* Create a data range and add it to the list of data ranges for
                  * later migration (Need to capture this information here because
@@ -735,22 +831,102 @@ vdev_tiering_io_start(zio_t *zio) {
                 data_range->offset = zio->io_offset;
                 data_range->size = zio->io_size;
                 data_range->databuf = NULL;
+                data_range->orig_zio = zio;
                 memcpy(&data_range->blkptr, zio->io_bp, sizeof(blkptr_t));
-            }
+           // }
 
-            /* Schedule a write to the fast tier */
+
+
+           zio->io_prop.zp_copies = 1;
+
+           spa_t *perf_spa = tiering_map->performance_vdev->vdev_spa;
+           zio_prop_t *zp = &zio->io_prop;
+
+           vdev_dbgmsg(zio->io_vd, "vdev_tiering_io_start zp_checksum %d",
+                        zp->zp_checksum);
+
+           /* TODO this is a workaround because zp_checksum is set to inherit
+            * but needs to be higher, need to create a new zio_prop with
+            * the correct settings */
+           zp->zp_checksum = ZIO_CHECKSUM_OFF;
+           zp->zp_compress = ZIO_COMPRESS_OFF;
+
+           ASSERT(zp->zp_checksum >= ZIO_CHECKSUM_OFF);
+           ASSERT(zp->zp_checksum < ZIO_CHECKSUM_FUNCTIONS);
+           ASSERT(zp->zp_compress >= ZIO_COMPRESS_OFF);
+           ASSERT(zp->zp_compress < ZIO_COMPRESS_FUNCTIONS);
+           ASSERT(DMU_OT_IS_VALID(zp->zp_type));
+           ASSERT(zp->zp_level < 32);
+           ASSERT(zp->zp_copies > 0);
+           ASSERT(zp->zp_copies <= spa_max_replication(perf_spa));
+
+
+
+           vdev_dbgmsg(zio->io_vd,
+                       "Inside of vdev_tiering_io_start before zio_wait: io_metaslab_class %p",
+                       zio->io_metaslab_class);
+
+/* Code for doing writes */
+//           spa_config_enter(perf_spa, SCL_ALL, FTAG, RW_READER);
+//
+//           /* Schedule a write to the fast tier */
+//           zio_wait(
+//                   zio_write(NULL,
+//                             perf_spa,
+//                             spa_syncing_txg(perf_spa),// zio->io_txg,
+//                             zio->io_bp,
+//                             zio->io_abd,
+//                             zio->io_lsize,
+//                             zio->io_size,
+//                             &zio->io_prop,
+//                             NULL,
+//                             NULL,
+//                             NULL,
+//                             vdev_tiering_performance_write_child_done,
+//                             data_range,
+//                             zio->io_priority,
+//                             zio->io_flags,
+//                             NULL));
+
+//           spa_config_exit(perf_spa, SCL_ALL, FTAG);
+
+
+            /* Write the data to the physical location on the performance tier */
+            spa_config_enter(perf_spa, SCL_ALL, FTAG, RW_READER);
+
+            zio_wait(
+                    zio_write_phys(NULL,
+                                   tiering_map->performance_vdev->vdev_child[0],
+                                   zio->io_offset,
+                                   zio->io_size,
+                                   zio->io_abd,
+                                   ZIO_CHECKSUM_OFF,
+                                   vdev_tiering_performance_write_child_done,
+                                   data_range,
+                                   zio->io_priority,
+                                   ZIO_FLAG_CANFAIL,
+                                   B_FALSE));
+
+            spa_config_exit(perf_spa, SCL_ALL, FTAG);
+
+
+            vdev_dbgmsg(zio->io_vd, "Inside of vdev_tiering_io_start after zio_wait");
+
+
+            /* Create a child vdev io that only allocates on the capacity tier */
             zio_nowait(
                     zio_vdev_child_io(zio,
                                       zio->io_bp,
-                                      tiering_map->performance_vdev,
+                                      tiering_map->capacity_vdev,
                                       zio->io_offset,
                                       zio->io_abd,
                                       zio->io_size,
                                       zio->io_type,
                                       zio->io_priority,
-                                      0,
-                                      vdev_tiering_performance_write_child_done,
+                                      ZIO_FLAG_NODATA,
+                                      vdev_tiering_capacity_allocate_child_done,
                                       data_range));
+
 
             /* Execute zio */
             zio_execute(zio);

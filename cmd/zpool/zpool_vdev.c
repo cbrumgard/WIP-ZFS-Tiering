@@ -1131,14 +1131,14 @@ is_grouping(const char *type, int *mindev, int *maxdev)
 	}
 
     if (strcmp(type, "tiering") == 0) {
-        /* TODO currently, number of devices must be 2 for tiering.  This can
+        /* TODO currently, number of devices must be 1 for tiering.  This can
          * change later */
         if (maxdev != NULL) {
-            *maxdev = 2;
+            *maxdev = 1;
         }
 
         if (mindev != NULL) {
-            *mindev = 2;
+            *mindev = 1;
         }
 
         return (VDEV_TYPE_TIERING);
