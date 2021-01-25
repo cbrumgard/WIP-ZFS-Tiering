@@ -99,9 +99,9 @@ struct tiering_map {
 static void
 vdev_tiering_performance_read_migration_child_done(zio_t *zio) {
 
-    //vdev_dbgmsg(zio->io_vd,
-    // "Inside of vdev_tiering_performance_migration_read_child_done, error = %d",
-    // zio->io_error);
+    vdev_dbgmsg(zio->io_vd,
+     "Inside of vdev_tiering_performance_migration_read_child_done, error = %d",
+     zio->io_error);
 
     /* TODO check error conditions */
 
@@ -169,7 +169,7 @@ vdev_tiering_performance_read_migration_child_done(zio_t *zio) {
 static void
 vdev_tiering_performance_write_migration_child_done(zio_t *zio) {
 
-    //vdev_dbgmsg(zio->io_vd, "Inside of %s, error = %d", __FUNCTION__, zio->io_error);
+    vdev_dbgmsg(zio->io_vd, "Inside of %s, error = %d", __FUNCTION__, zio->io_error);
 
     data_range_t *data_range = zio->io_private;
     tiering_map_t *tiering_map = data_range->tiering_map;
@@ -230,17 +230,30 @@ migration_issue_reads(zio_t *parent_zio, tiering_map_t *tiering_map, list_t *lis
         data_range->databuf = abd_alloc(data_range->size, B_FALSE);
 
         /* Read in the data from the performance tier */
-        zio_nowait(zio_vdev_child_io(parent_zio,
-                                     NULL,
-                                     tiering_map->performance_vdev,
-                                     data_range->offset,
-                                     data_range->databuf,
-                                     data_range->size,
-                                     ZIO_TYPE_READ,
-                                     ZIO_PRIORITY_ASYNC_READ,
-                                     0,
-                                     vdev_tiering_performance_read_migration_child_done,
-                                     data_range));
+        zio_nowait(
+                zio_read_phys(parent_zio,
+                              tiering_map->performance_vdev->vdev_child[0],
+                              data_range->offset,
+                              data_range->size,
+                              data_range->databuf,
+                              ZIO_CHECKSUM_OFF,
+                              vdev_tiering_performance_read_migration_child_done,
+                              data_range,
+                              ZIO_PRIORITY_ASYNC_READ,
+                              ZIO_FLAG_CANFAIL,
+                              B_FALSE));
+
+//                zio_vdev_child_io(parent_zio,
+//                                     NULL,
+//                                     tiering_map->performance_vdev,
+//                                     data_range->offset,
+//                                     data_range->databuf,
+//                                     data_range->size,
+//                                     ZIO_TYPE_READ,
+//                                     ZIO_PRIORITY_ASYNC_READ,
+//                                     0,
+//                                     vdev_tiering_performance_read_migration_child_done,
+//                                     data_range));
     }
 
 
@@ -291,8 +304,8 @@ migration_issue_writes(zio_t *parent_zio, tiering_map_t *tiering_map, list_t *li
     return parent_zio;
 }
 
-#define migration_thread_sleep_interval 60
-#define MAX_BUFS_PER_ROUND 64
+#define migration_thread_sleep_interval 30
+#define MAX_BUFS_PER_ROUND 4
 
 static void migration_thread(void *arg) {
 
@@ -379,9 +392,10 @@ static void migration_thread(void *arg) {
 
         /* Lock the spa and create a parent zio that will unlock it on
          * completion of the io operations */
-        spa_vdev_state_enter(tiering_map->performance_vdev->vdev_spa, RW_READER);
+//        spa_vdev_state_enter(tiering_map->performance_vdev->vdev_spa, RW_READER);
 
-
+        spa_config_enter(tiering_map->performance_vdev->vdev_spa, SCL_ALL, FTAG, RW_READER);
+        spa_config_enter(tiering_map->capacity_vdev->vdev_spa, SCL_ALL, FTAG, RW_READER);
 
 
         if(list_is_empty(&from_performance_tier_data_ranges) == B_FALSE) {
@@ -402,9 +416,10 @@ static void migration_thread(void *arg) {
         zio_wait(parent_zio);
 
         //delay(SEC_TO_TICK(10));
-        spa_vdev_state_exit(tiering_map->performance_vdev->vdev_spa,
-                            tiering_map->performance_vdev, 0);
-
+//        spa_vdev_state_exit(tiering_map->performance_vdev->vdev_spa,
+//                            tiering_map->performance_vdev, 0);
+        spa_config_exit(tiering_map->performance_vdev->vdev_spa, SCL_ALL, FTAG);
+        spa_config_exit(tiering_map->capacity_vdev->vdev_spa, SCL_ALL, FTAG);
 
         /* TODO need to know when to free the parent and children zios */
         parent_zio = NULL;
@@ -708,16 +723,40 @@ vdev_tiering_capacity_allocate_child_done(zio_t *zio) {
     data_range_t *data_range = zio->io_private;
 
 
-    char buf1[256];
-    char buf2[256];
+//    char buf1[256];
+//    char buf2[256];
+//
+//
+//    snprintf_blkptr(buf1, sizeof(buf1), &data_range->blkptr);
+//    snprintf_blkptr(buf2, sizeof(buf2), zio->io_bp);
+//
+//
+//    vdev_dbgmsg(zio->io_vd, "orig bp = %s", buf1);
+//    vdev_dbgmsg(zio->io_vd, "new bp  = %s", buf2);
+
+    /* No migration is required */
+    if(data_range == NULL) {
+        vdev_dbgmsg(zio->io_vd, "Inside of %s, no migration is required", __FUNCTION__);
+    }
 
 
-    snprintf_blkptr(buf1, sizeof(buf1), &data_range->blkptr);
-    snprintf_blkptr(buf2, sizeof(buf2), zio->io_bp);
+    tiering_map_t *tiering_map = data_range->tiering_map;
+    kmutex_t *lock = &tiering_map->tiering_migration_thr_lock;
+    //kcondvar_t *cv = &tiering_map->tiering_migration_thr_cv;
+
+    /* TODO check for errors on write to performance tier */
+
+    /* TODO see how zio->io_priority works, might be able to modify it to make
+     * this less important */
 
 
-    vdev_dbgmsg(zio->io_vd, "orig bp = %s", buf1);
-    vdev_dbgmsg(zio->io_vd, "new bp  = %s", buf2);
+    mutex_enter(lock);
+    list_insert_head(&tiering_map->from_performance_tier_data_ranges, data_range);
+
+    /* TODO temporarily disable signal for demo */
+    //cv_signal(cv);
+
+    mutex_exit(lock);
 }
 
 static void
@@ -834,6 +873,8 @@ vdev_tiering_io_start(zio_t *zio) {
                 data_range->orig_zio = zio;
                 memcpy(&data_range->blkptr, zio->io_bp, sizeof(blkptr_t));
            // }
+
+
 
 
 
