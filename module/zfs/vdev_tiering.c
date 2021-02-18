@@ -17,17 +17,54 @@ typedef struct data_range data_range_t;
 typedef struct tiering_map tiering_map_t;
 
 
+/* TODO Need to autodetect this */
+#define PERF_TIER_ALLOC_TRACKER_RECORD_SIZE 1048576
+
+
+struct block_alloc_dist {
+    u_int64_t size;
+    u_int32_t ratio;
+};
+
+static struct block_alloc_dist block_alloc_dist[] = {
+        { .size = 512,  .ratio = 512  },
+        { .size = 1024, .ratio = 256  },
+        { .size = 2048, .ratio = 256  },
+        { .size = PERF_TIER_ALLOC_TRACKER_RECORD_SIZE, .ratio = 1 }, };
+
+#define NUM_BLOCK_SIZES (sizeof(block_alloc_dist)/sizeof(block_alloc_dist[0]))
+
+
+
+/* TODO remove, for analysis and debugging */
+static int bsize_by_txg[512][NUM_BLOCK_SIZES];
+
 
 struct perf_tier_alloc_tracker {
 
-    /* Total number of buckets */
-    u_int64_t num_buckets;
+    struct bucket {
 
-    /* Number of free buckets remaining */
-    u_int64_t num_free_buckets;
+        /* Total number of buckets */
+        u_int64_t nblocks;
 
-    /* Pointer to the head of the free list */
-    u_int64_t free_idx_head;
+        /* Number of free buckets remaining */
+        u_int64_t nfree_blocks;
+
+        /* Pointer to the head of the free list */
+        u_int64_t free_idx_head;
+
+        /* Size of blocks */
+        u_int64_t bsize;
+
+        /* Base address of the blocks */
+        u_int64_t addr_base;
+
+        /* List of blocks (The index serves as the slot id.  The entry contains
+         * the next number or -1 if occupied */
+        u_int64_t blocks[0] __attribute__((aligned));
+
+    } *buckets[NUM_BLOCK_SIZES];
+
 
     /* Locking and signaling mechanisms */
     kmutex_t perf_tier_allocs_lock;
@@ -36,10 +73,6 @@ struct perf_tier_alloc_tracker {
     avl_tree_t address_tree;
 
     krwlock_t lock;
-
-    /* List of buckets (The index serves as the slot id.  The entry contains
-     * the next number or -1 if occupied */
-    u_int64_t buckets[0] __attribute__((aligned));
 };
 
 
@@ -80,16 +113,6 @@ struct data_range {
 };
 
 
-//struct address_map {
-//
-//    avl_tree_t address_tree;
-//
-//    krwlock_t lock;
-//
-//    struct perf_tier_alloc_tracker *perf_tier_alloc_tracker;
-//};
-
-
 struct tiering_map {
 
     /* My vdev */
@@ -124,33 +147,9 @@ struct tiering_map {
     /* Flag for controlling the tiering thread */
     u_int8_t tiering_thread_exit;
 
-
     /* Allocator tracker for the performance tier */
     struct perf_tier_alloc_tracker *perf_tier_alloc_tracker;
-
-
-//    struct address_map *address_map;
-
-
-    /*** Water marks for locating data ***/
-
-    /* All transactions at or below this number are on the capacity tier */
-    uint64_t on_capcity_tier_txg;
-
-    /* All transactions at or above this number still reside on the
-     * performance tier */
-    uint64_t on_perf_tier_txg;
-
-//    /* TODO list for tracking prev writes */
-//    list_t prev_writes;
-
 };
-
-//
-//static void
-//performance_tier_alloc_tracker_release_block(
-//        struct perf_tier_alloc_tracker *perf_tier_alloc_tracker,
-//        u_int64_t address, u_int64_t size);
 
 
 static data_range_t *
@@ -185,14 +184,6 @@ data_range_destroy(data_range_t *data_range) {
 
     ASSERT(zfs_refcount_count(&data_range->refcount) == 0);
 
-    /* Release the performance tier block */
-//    if(data_range->perf_offset != -1) {
-//
-//        performance_tier_alloc_tracker_release_block(
-//                data_range->perf_tier_alloc_tracker, data_range->perf_offset,
-//                data_range->perf_size);
-//    }
-
     zfs_refcount_destroy(&data_range->refcount);
 
     kmem_free(data_range, sizeof(data_range_t));
@@ -201,10 +192,9 @@ data_range_destroy(data_range_t *data_range) {
 static void
 data_range_reference_change(data_range_t *data_range) {
 
-
     mutex_enter(&data_range->perf_tier_alloc_tracker->perf_tier_allocs_lock);
 
-    cv_signal(&data_range->perf_tier_alloc_tracker->perf_tier_allocs_cv);
+    cv_broadcast(&data_range->perf_tier_alloc_tracker->perf_tier_allocs_cv);
 
     mutex_exit(&data_range->perf_tier_alloc_tracker->perf_tier_allocs_lock);
 }
@@ -234,48 +224,49 @@ address_compare(const void *v1, const void *v2) {
     return 0;
 }
 
-/* TODO Need to autodetect this */
-#define PERF_TIER_ALLOC_TRACKER_RECORD_SIZE 1048576
+
 
 static struct perf_tier_alloc_tracker *
 allocate_perf_tier_alloc_tracker(vdev_t *vd) {
 
-
-    //metaslab_group_t *mg = vd->vdev_mg;
-
-
-    //zfs_dbgmsg("Inside of %s: space available %p", metaslab_group_get_space(vd->vdev_child[0]->vdev_mg));
-
-    //metaslab_group_initialized(mg)); //metaslab_group_get_space(mg));
-
-    //uint64_t
-    //metaslab_block_alloc(metaslab_t *msp, uint64_t size, uint64_t txg)
+    u_int64_t num_blocks[NUM_BLOCK_SIZES];
 
 
-    zfs_dbgmsg("Inside of %s: space available %d buckets = %d", __FUNCTION__,
-               vd->vdev_psize, vd->vdev_psize/PERF_TIER_ALLOC_TRACKER_RECORD_SIZE);
+    num_blocks[NUM_BLOCK_SIZES - 1] = (vd->vdev_psize/
+            block_alloc_dist[NUM_BLOCK_SIZES - 1].size) -
+                    (block_alloc_dist[NUM_BLOCK_SIZES - 1].ratio);
 
-    uint64_t num_buckets = vd->vdev_psize/PERF_TIER_ALLOC_TRACKER_RECORD_SIZE;
+    for(int i=0; i<NUM_BLOCK_SIZES-1; i++) {
+        num_blocks[i] = block_alloc_dist[i].ratio *
+                block_alloc_dist[NUM_BLOCK_SIZES - 1].ratio;
+    }
+
+
+    int64_t remaining_size = vd->vdev_psize;
+
+    for(int i=0; i<NUM_BLOCK_SIZES; i++) {
+        ASSERT(num_blocks[i] > 0);
+
+        remaining_size -= num_blocks[i] * block_alloc_dist[i].size;
+
+        ASSERT(remaining_size >= 0);
+    }
+
+
+    zfs_dbgmsg("Inside of %s: space available %lld remaining_space %lld",
+               __FUNCTION__, vd->vdev_psize, remaining_size);
+
+    for(int i=0; i<NUM_BLOCK_SIZES; i++) {
+        zfs_dbgmsg("\tBucket size: %d num: %d", block_alloc_dist[i].size,
+                   num_blocks[i]);
+    }
 
     /* Allocate an instance of the perf tiers allocation tracker */
     struct perf_tier_alloc_tracker *perf_tier_alloc_tracker =
-            kmem_zalloc(sizeof(struct perf_tier_alloc_tracker) + num_buckets*sizeof(u_int64_t), KM_SLEEP);
+            kmem_zalloc(sizeof(struct perf_tier_alloc_tracker), KM_SLEEP);
 
     /* If the allocation was successful, initialize the struct */
     if(perf_tier_alloc_tracker != NULL) {
-
-        perf_tier_alloc_tracker->num_buckets = num_buckets;
-        perf_tier_alloc_tracker->num_free_buckets = num_buckets;
-        perf_tier_alloc_tracker->free_idx_head = 0;
-
-        /* Each bucket entry points to the next free */
-        for(u_int64_t i=0; i<num_buckets-1; i++) {
-            perf_tier_alloc_tracker->buckets[i] = i+1;
-        }
-
-        /* The last bucket points to the sentinel value */
-        perf_tier_alloc_tracker->buckets[num_buckets-1] = (u_int64_t) -1;
-
 
         /* Initialize the avl tree for holding the data range */
         avl_create(&perf_tier_alloc_tracker->address_tree, address_compare,
@@ -289,10 +280,74 @@ allocate_perf_tier_alloc_tracker(vdev_t *vd) {
 
         /* Initialize the rw lock for protecting the address map */
         rw_init(&perf_tier_alloc_tracker->lock, NULL, RW_DEFAULT, NULL);
+
+        u_int64_t addr_base = 0;
+
+        for(int i=NUM_BLOCK_SIZES-1; i>-1; i--) {
+
+            struct bucket *bucket = kmem_zalloc(
+                    sizeof(struct bucket) + num_blocks[i]*sizeof(u_int64_t), KM_SLEEP);
+
+            if(perf_tier_alloc_tracker != NULL) {
+                bucket->nblocks = num_blocks[i];
+                bucket->nfree_blocks = num_blocks[i];
+                bucket->bsize = block_alloc_dist[i].size;
+
+
+                /* Each bucket entry points to the next free */
+                for(u_int64_t idx=0; idx<num_blocks[i]-1; idx++) {
+                    bucket->blocks[idx] = idx+1;
+                }
+
+                /* Point the free list to the start of the buckets */
+                bucket->free_idx_head = 0;
+
+                /* The last bucket points to the sentinel value */
+                bucket->blocks[num_blocks[i]-1] = (u_int64_t) -1;
+
+                /* Address of the start of the blocks on the vdev */
+                bucket->addr_base = addr_base;
+                addr_base += num_blocks[i] * block_alloc_dist[i].size;
+
+                perf_tier_alloc_tracker->buckets[i] = bucket;
+
+            } else {
+                goto ERROR_HANDLER;
+            }
+        }
     }
 
     /* Return the perf tier allocs */
     return perf_tier_alloc_tracker;
+
+    ERROR_HANDLER:
+
+
+        if(perf_tier_alloc_tracker != NULL) {
+
+            for(int i=0; i<NUM_BLOCK_SIZES; i++) {
+
+                if(perf_tier_alloc_tracker->buckets[i] != NULL) {
+                    kmem_free(perf_tier_alloc_tracker->buckets[i],
+                              sizeof(struct bucket) + num_blocks[i] * sizeof(u_int64_t));
+                }
+            }
+
+            /* Free the avl tree */
+            avl_destroy(&perf_tier_alloc_tracker->address_tree);
+
+            /* Free the rw lock */
+            rw_destroy(&perf_tier_alloc_tracker->lock);
+
+
+            mutex_destroy(&(perf_tier_alloc_tracker->perf_tier_allocs_lock));
+            cv_destroy(&(perf_tier_alloc_tracker->perf_tier_allocs_cv));
+
+
+            kmem_free(perf_tier_alloc_tracker, sizeof(struct perf_tier_alloc_tracker));
+        }
+
+    return NULL;
 }
 
 
@@ -325,12 +380,35 @@ free_performance_tier_alloc_tracker(struct perf_tier_alloc_tracker *perf_tier_al
     mutex_destroy(&(perf_tier_alloc_tracker->perf_tier_allocs_lock));
     cv_destroy(&(perf_tier_alloc_tracker->perf_tier_allocs_cv));
 
+    for(int i=0; i<NUM_BLOCK_SIZES; i++) {
+
+        kmem_free(perf_tier_alloc_tracker->buckets[i],
+                  sizeof(struct bucket) + perf_tier_alloc_tracker->buckets[i]->nblocks*sizeof(u_int64_t));
+    }
+
+
     kmem_free(perf_tier_alloc_tracker,
-              sizeof(struct perf_tier_alloc_tracker)+
-                      (perf_tier_alloc_tracker->num_buckets*sizeof(u_int64_t)));
+              sizeof(struct perf_tier_alloc_tracker));
 
 }
 
+
+static struct bucket *
+performance_tier_alloc_tracker_find_bucket(
+        struct perf_tier_alloc_tracker *perf_tier_alloc_tracker,
+        u_int64_t size) {
+
+    struct bucket *bucket = NULL;
+
+    /* Get the bucket index for the size requested */
+    for(int i=0; i<NUM_BLOCK_SIZES && bucket == NULL; i++) {
+        if(size <= block_alloc_dist[i].size){
+            bucket = perf_tier_alloc_tracker->buckets[i];
+        }
+    }
+
+    return bucket;
+}
 
 static struct data_range *
 performance_tier_alloc_tracker_get_block(
@@ -350,13 +428,20 @@ performance_tier_alloc_tracker_get_block(
 
     zfs_refcount_transfer_ownership(&data_range->refcount, data_range_create, FTAG);
 
+
+    struct bucket *bucket = performance_tier_alloc_tracker_find_bucket(
+            perf_tier_alloc_tracker, size);
+
+    ASSERT(bucket != NULL);
+
     mutex_enter(&perf_tier_alloc_tracker->perf_tier_allocs_lock);
 
-    /* Wait until there are free buckets */
-    while(perf_tier_alloc_tracker->num_free_buckets == 0) {
-        zfs_dbgmsg("Inside of %s: Out of buckets", __FUNCTION__);
 
-        // Need to get the address map release mappings here
+    /* Wait until there are free buckets */
+    while(bucket->nfree_blocks == 0) {
+        zfs_dbgmsg("Inside of %s: Out of blocks for bucket size %lld", __FUNCTION__, bucket->bsize);
+
+        int nevicts = 0;
 
         rw_enter(&perf_tier_alloc_tracker->lock, RW_WRITER);
 
@@ -366,7 +451,7 @@ performance_tier_alloc_tracker_get_block(
         if(evict_candiate_dr != NULL) {
 
             /* Get the transaction group to free */
-            u_int64_t txg = evict_candiate_dr->blkptr.blk_birth;
+            //u_int64_t txg = evict_candiate_dr->blkptr.blk_birth;
 
             do {
 
@@ -375,63 +460,101 @@ performance_tier_alloc_tracker_get_block(
                 /* Get the current reference count */
                 int64_t refcount = zfs_refcount_count(&evict_candiate_dr->refcount);
 
-                zfs_dbgmsg("Inside of %s, refcount = %d", __FUNCTION__, refcount);
-
 
                 /* If there is only one reference count, then we can release this one */
                 if (refcount == 1) {
 
-                    avl_remove(&perf_tier_alloc_tracker->address_tree, evict_candiate_dr);
+                    struct bucket *evict_bucket = performance_tier_alloc_tracker_find_bucket(perf_tier_alloc_tracker, evict_candiate_dr->perf_size);
 
-                    u_int64_t bucket_idx = evict_candiate_dr->perf_offset / PERF_TIER_ALLOC_TRACKER_RECORD_SIZE;
+                    if(evict_bucket->bsize == bucket->bsize) {
 
-                    /* Add the free block back to the list of free records in the buckets */
-                    perf_tier_alloc_tracker->buckets[bucket_idx] =
-                            perf_tier_alloc_tracker->free_idx_head;
+                        avl_remove(&perf_tier_alloc_tracker->address_tree, evict_candiate_dr);
 
-                    perf_tier_alloc_tracker->free_idx_head = bucket_idx;
+                        u_int64_t block_idx = (evict_candiate_dr->perf_offset - evict_bucket->addr_base) /
+                                evict_bucket->bsize;
 
-                    /* Increment the number of free buckets */
-                    perf_tier_alloc_tracker->num_free_buckets++;
 
-                    zfs_refcount_remove(&evict_candiate_dr->refcount, &perf_tier_alloc_tracker->address_tree);
+                        zfs_dbgmsg(
+                                "Inside of %s: eviction bucket size = %lld eviction block idx = %lld",
+                                __FUNCTION__,
+                                evict_bucket->bsize, block_idx);
 
-                    data_range_destroy(evict_candiate_dr);
+                        ASSERT(evict_bucket->bsize >= evict_candiate_dr->perf_size);
+                        ASSERT(block_idx < evict_bucket->nblocks && block_idx >= 0);
+
+                        /* Add the free block back to the list of free records in the buckets */
+                        evict_bucket->blocks[block_idx] =
+                                evict_bucket->free_idx_head;
+
+                        evict_bucket->free_idx_head = block_idx;
+
+                        /* Increment the number of free buckets */
+                        evict_bucket->nfree_blocks++;
+
+                        zfs_refcount_remove(&evict_candiate_dr->refcount,
+                                            &perf_tier_alloc_tracker->address_tree);
+
+                        data_range_destroy(evict_candiate_dr);
+
+                        nevicts++;
+                        break;
+                    }
                 }
 
                 evict_candiate_dr = next_dr;
 
-            }while(evict_candiate_dr != NULL && evict_candiate_dr->blkptr.blk_birth == txg);
-
+            }while(evict_candiate_dr != NULL /*&& evict_candiate_dr->blkptr.blk_birth == txg*/);
         }
 
         rw_exit(&perf_tier_alloc_tracker->lock);
 
         /* Need to sleep here until one is free, wait until signal
          * for data object change */
-        if(perf_tier_alloc_tracker->num_free_buckets == 0) {
+        if(bucket->nfree_blocks == 0 && nevicts == 0) {
             cv_wait(&perf_tier_alloc_tracker->perf_tier_allocs_cv,
                     &perf_tier_alloc_tracker->perf_tier_allocs_lock);
+        }
+
+        if(nevicts > 0) {
+            cv_broadcast(&data_range->perf_tier_alloc_tracker->perf_tier_allocs_cv);
         }
     }
 
 
+    /* TODO remove, for analysis and debugging */
+    {
+        int bucket_idx = 0;
+        for(bucket_idx=0; bucket_idx<NUM_BLOCK_SIZES; bucket_idx++) {
+            if(bucket == perf_tier_alloc_tracker->buckets[bucket_idx]) {
+                break;
+            }
+        }
+
+        bsize_by_txg[bp->blk_birth][bucket_idx]++;
+    }
+
+
     /* Get the index for the free bucket */
-    u_int64_t bucket_idx = perf_tier_alloc_tracker->free_idx_head;
+    u_int64_t block_idx = bucket->free_idx_head;
+
+    zfs_dbgmsg("Inside of %s: bucket size = %lld block idx = %lld", __FUNCTION__,
+               bucket->bsize, block_idx);
+    ASSERT(block_idx >= 0 && block_idx < bucket->nblocks);
 
     /* Update the free index to the next free bucket index */
-    perf_tier_alloc_tracker->free_idx_head =
-            perf_tier_alloc_tracker->buckets[bucket_idx];
+    bucket->free_idx_head = bucket->blocks[block_idx];
 
     /* Decrement the number of free buckets */
-    perf_tier_alloc_tracker->num_free_buckets--;
+    bucket->nfree_blocks--;
 
     mutex_exit(&perf_tier_alloc_tracker->perf_tier_allocs_lock);
 
 
-    data_range->perf_offset = bucket_idx * PERF_TIER_ALLOC_TRACKER_RECORD_SIZE;
+    data_range->perf_offset = block_idx * bucket->bsize + bucket->addr_base;
 
 
+    ASSERT(data_range->perf_offset >= bucket->addr_base &&
+           data_range->perf_offset < bucket->addr_base+(bucket->nblocks*bucket->bsize));
 
 
     avl_index_t where = 0;
@@ -471,40 +594,13 @@ performance_tier_alloc_tracker_get_block(
     return data_range;
 }
 
-//static void
-//performance_tier_alloc_tracker_release_block(
-//        struct perf_tier_alloc_tracker *perf_tier_alloc_tracker,
-//        u_int64_t address, u_int64_t size) {
-//
-//
-//    ASSERT(size <= PERF_TIER_ALLOC_TRACKER_RECORD_SIZE);
-//
-//    /* Get the index for the free bucket */
-//    u_int64_t bucket_idx = address / PERF_TIER_ALLOC_TRACKER_RECORD_SIZE;
-//
-//
-//    mutex_enter(&perf_tier_alloc_tracker->perf_tier_allocs_lock);
-//
-//    /* Add the free block back to the list of free records in the buckets */
-//    perf_tier_alloc_tracker->buckets[bucket_idx] =
-//            perf_tier_alloc_tracker->free_idx_head;
-//
-//    perf_tier_alloc_tracker->free_idx_head = bucket_idx;
-//
-//    /* Increment the number of free buckets */
-//    perf_tier_alloc_tracker->num_free_buckets++;
-//
-//    cv_signal(&perf_tier_alloc_tracker->perf_tier_allocs_cv);
-//
-//    mutex_exit(&perf_tier_alloc_tracker->perf_tier_allocs_lock);
-//}
-
-
 
 static void
 vdev_tiering_performance_read_migration_child_done(zio_t *zio) {
 
     zfs_dbgmsg("Inside of %s, error = %d", __FUNCTION__, zio->io_error);
+
+    ASSERT(zio->io_error == 0);
 
     /* TODO check error conditions */
 
@@ -532,54 +628,13 @@ vdev_tiering_performance_read_migration_child_done(zio_t *zio) {
     mutex_exit(lock);
 }
 
-//static void
-//vdev_tiering_performance_read_migration_parent_done(zio_t *zio) {
-//
-//    vdev_dbgmsg(zio->io_vd, "Inside of %s, error = %d", __FUNCTION__, zio->io_error);
-//
-//
-////    tiering_map_t *tiering_map = zio->io_private;
-////    kmutex_t *lock = &tiering_map->tiering_migration_thr_lock;
-////    kcondvar_t *cv = &tiering_map->tiering_migration_thr_cv;
-//
-//    //vdev_dbgmsg(zio->io_vd, "Inside of %s, error = %d", __FUNCTION__, zio->io_error);
-//
-//
-//    /* TODO check error conditions */
-//
-//
-//
-//
-////    spa_vdev_state_exit(tiering_map->performance_vdev->vdev_spa,
-////                        tiering_map->performance_vdev, 0);
-//
-//
-//
-///* TODO need to get this part working, but can't figure out to get the
-// * parent zio to step */
-////    spa_vdev_state_exit(tiering_map->tiering_vdev->vdev_spa,
-////                        tiering_map->tiering_vdev, 0);
-////    mutex_enter(lock);
-////
-////    /* Move the data ranges (io_private of child) that are done to the ready
-////     * to be written to the capacity tier list and signal the migration thread */
-////    for(zio_t *child_zio = list_head(&(zio->io_child_list));
-////        child_zio != NULL;
-////        child_zio = list_next(&(zio->io_child_list), child_zio)) {
-////
-////        list_insert_head(&(tiering_map->to_capacity_tier_data_ranges),
-////                         child_zio->io_private);
-////    }
-////
-////    cv_signal(cv);
-////    mutex_exit(lock);
-//}
-
 
 static void
 vdev_tiering_performance_write_migration_child_done(zio_t *zio) {
 
     zfs_dbgmsg("Inside of %s, error = %d", __FUNCTION__, zio->io_error);
+
+    ASSERT(zio->io_error == 0);
 
     /* Get access to the data range and transferownership to this function */
     data_range_t *data_range = zio->io_private;
@@ -667,18 +722,6 @@ migration_issue_reads(zio_t *parent_zio, tiering_map_t *tiering_map, list_t *lis
         zfs_refcount_transfer_ownership(&data_range->refcount, FTAG, zio);
 
         zio_nowait(zio);
-
-//                zio_vdev_child_io(parent_zio,
-//                                     NULL,
-//                                     tiering_map->performance_vdev,
-//                                     data_range->offset,
-//                                     data_range->databuf,
-//                                     data_range->size,
-//                                     ZIO_TYPE_READ,
-//                                     ZIO_PRIORITY_ASYNC_READ,
-//                                     0,
-//                                     vdev_tiering_performance_read_migration_child_done,
-//                                     data_range));
     }
 
 
@@ -718,25 +761,13 @@ migration_issue_writes(zio_t *parent_zio, tiering_map_t *tiering_map, list_t *li
         zfs_refcount_transfer_ownership(&data_range->refcount, FTAG, zio);
 
         zio_nowait(zio);
-
-//        zio_wait(zio_write_phys(NULL,
-//                                  tiering_map->capacity_vdev,
-//                                  data_range->offset,
-//                                  data_range->size,
-//                                  data_range->databuf,
-//                                  ZIO_CHECKSUM_OFF,
-//                                  vdev_tiering_performance_write_migration_child_done,
-//                                  data_range,
-//                                  ZIO_PRIORITY_ASYNC_WRITE,
-//                                0,
-//                                  B_FALSE));
     }
 
     return parent_zio;
 }
 
-#define migration_thread_sleep_interval 30
-#define MAX_BUFS_PER_ROUND 4
+#define migration_thread_sleep_interval 20
+#define MAX_BUFS_PER_ROUND 2
 
 static void migration_thread(void *arg) {
 
@@ -759,10 +790,15 @@ static void migration_thread(void *arg) {
     mutex_enter(&(tiering_map->tiering_migration_thr_lock));
     while(tiering_map->tiering_thread_exit == 0) {
 
-        while((tiering_map->num_of_free_bufs == 0 ||
-               list_is_empty(&tiering_map->from_performance_tier_data_ranges)) &&
+        while(/*tiering_map->num_of_free_bufs != MAX_BUFS_PER_ROUND &&*/
+              list_is_empty(&tiering_map->from_performance_tier_data_ranges) &&
               list_is_empty(&tiering_map->to_capacity_tier_data_ranges) &&
               tiering_map->tiering_thread_exit == 0) {
+
+            zfs_dbgmsg("migration_thread sleep: num_of_free_bufs %d", tiering_map->num_of_free_bufs);
+            zfs_dbgmsg("migration_thread sleep: from_perf_tier %d", list_is_empty(&tiering_map->from_performance_tier_data_ranges));
+            zfs_dbgmsg("migration_thread sleep: from_tier %d", list_is_empty(&tiering_map->to_capacity_tier_data_ranges));
+
             cv_timedwait(&(tiering_map->tiering_migration_thr_cv),
                          &(tiering_map->tiering_migration_thr_lock),
                          ddi_get_lbolt() + SEC_TO_TICK(
@@ -775,6 +811,10 @@ static void migration_thread(void *arg) {
 //        mutex_enter(&(tiering_map->tiering_migration_thr_lock));
 
         zfs_dbgmsg("migration_thread is awake");
+        zfs_dbgmsg("migration_thread awake: num_of_free_bufs %d", tiering_map->num_of_free_bufs);
+        zfs_dbgmsg("migration_thread awake: from_perf_tier %d", list_is_empty(&tiering_map->from_performance_tier_data_ranges));
+        zfs_dbgmsg("migration_thread awake: from_tier %d", list_is_empty(&tiering_map->to_capacity_tier_data_ranges));
+
 
         /* There are data ranges on the performance tier to be migrated, move
          * them to a non-contended list */
@@ -876,143 +916,6 @@ static void migration_thread(void *arg) {
 }
 
 
-
-//
-//static struct address_map *
-//allocate_address_tracker(struct perf_tier_alloc_tracker *perf_tier_alloc_tracker) {
-//
-//    /* Allocate memory for the address map translation */
-//    struct address_map *address_map = kmem_alloc(sizeof(struct address_map), KM_SLEEP);
-//
-//    if(address_map != NULL) {
-//
-//        /* Initialize the avl tree for holding the data range */
-//        avl_create(&address_map->address_tree, address_compare,
-//                   sizeof(data_range_t), offsetof(data_range_t, address_tree_link));
-//
-//        /* Initialize the rw lock for protecting the address map */
-//        rw_init(&address_map->lock, NULL, RW_DEFAULT, NULL);
-//
-//        address_map->perf_tier_alloc_tracker = perf_tier_alloc_tracker;
-//    }
-//
-//    return address_map;
-//}
-//
-//static void
-//free_address_tracker(struct address_map *address_map) {
-//
-//    /* Iterate through the nodes of the avl address tree and release the
-//     * resources tied to the nodes */
-//    for(data_range_t *cookie=NULL, *data_range=avl_destroy_nodes(&address_map->address_tree, (void **)&cookie);
-//        data_range != NULL;
-//        data_range=avl_destroy_nodes(&address_map->address_tree, (void **)&cookie)) {
-//
-//        if(data_range->databuf != NULL) {
-//            abd_free(data_range->databuf);
-//        }
-//
-//        data_range->databuf = NULL;
-//
-//        kmem_free(data_range, sizeof(*data_range));
-//    }
-//
-//    /* Free the avl tree */
-//    avl_destroy(&address_map->address_tree);
-//
-//    /* Free the rw lock */
-//    rw_destroy(&address_map->lock);
-//
-//    /* Free the address map struct */
-//    kmem_free(address_map, sizeof(struct address_map));
-//}
-
-//static void
-//address_map_add_mapping(struct address_map *address_map,
-//        data_range_t *data_range) {
-//
-//    zfs_dbgmsg("Inside of %s adding %llu:%llu", __FUNCTION__,
-//               data_range->blkptr.blk_birth, data_range->cap_offset);
-//
-//    avl_index_t where = 0;
-//    int64_t old_data_range_refcount = 0;
-//
-//
-//    rw_enter(&address_map->lock, RW_WRITER);
-//
-//
-//    /* Test if the original data exists */
-//    data_range_t *old_data_range = avl_find(&address_map->address_tree,
-//                                            data_range,
-//                                            &where);
-//    /* If it does, then remove it */
-//    if(old_data_range != NULL) {
-//
-//        ASSERT(old_data_range->cap_size == data_range->cap_size);
-//
-//        avl_remove(&address_map->address_tree, old_data_range);
-//
-//        old_data_range_refcount = zfs_refcount_remove(&old_data_range->refcount, address_map);
-//    }
-//
-//    /* Insert into the address tree */
-//    avl_add(&address_map->address_tree, data_range);
-//
-//    zfs_refcount_add(&data_range->refcount, address_map);
-//
-//    rw_exit(&address_map->lock);
-//
-//    /* If there was a previous entry and it's reference out has reached zero,
-//     * then free it */
-//    if(old_data_range != NULL && old_data_range_refcount == 0) {
-//        data_range_destroy(old_data_range);
-//    }
-//}
-
-
-//static data_range_t *
-//address_map_find_mapping(struct address_map *address_map, blkptr_t *bp,
-//        u_int64_t io_offset, u_int64_t io_size) {
-//
-//    data_range_t search = {
-//            .blkptr = *bp,
-//            .cap_offset = io_offset
-//    };
-//
-//    avl_index_t where;
-//
-//    rw_enter(&address_map->lock, RW_READER);
-//
-//    /* Find the mapping for the blkptr and offset */
-//    data_range_t *data_range = avl_find(&address_map->address_tree, &search, &where);
-//
-//    /* Not found so find the next lowest entry */
-//    if(data_range == NULL) {
-//        data_range = avl_nearest(&address_map->address_tree, where, AVL_BEFORE);
-//    }
-//
-//    /* TODO this check on the range may not be necessary or it may be necessary
-//     * to adjust the offsets on if they don't match so that the caller
-//     * will know how to adjust the I/O call offset correctly */
-//    /* Check the returned entry is valid and if not reset to NULL */
-//    if(data_range != NULL &&
-//            (data_range->cap_offset <= io_offset &&
-//                    (data_range->cap_offset+data_range->cap_size) >= (io_offset+io_size))) {
-//
-//        /* Increment the reference count on the data range before returning it */
-//        zfs_refcount_add(&data_range->refcount, FTAG);
-//
-//    } else {
-//        data_range = NULL;
-//    }
-//
-//
-//    rw_exit(&address_map->lock);
-//
-//    return data_range;
-//}
-
-
 static data_range_t *
 performance_tier_alloc_tracker_find_mapping(struct perf_tier_alloc_tracker *perf_tier_alloc_tracker,
         blkptr_t *bp, u_int64_t io_offset, u_int64_t io_size) {
@@ -1100,24 +1003,11 @@ vdev_tiering_map_init(vdev_t *my_vdev, vdev_t *fast_tier, vdev_t *slow_tier) {
                                                     minclsyspri);
 
 
-
-        /* TODO test code to track previous writes */
-//        list_create(&tiering_map->prev_writes, sizeof(data_range_t),
-//                    offsetof(data_range_t, prev_writes_list_node));
-
         tiering_map->perf_tier_alloc_tracker = perf_tier_alloc_tracker;
-
-
-        /* Initialize data locality tx watermarks */
-        tiering_map->on_capcity_tier_txg = 0;
-        tiering_map->on_perf_tier_txg = 0;
-
 
     } else {
         free_performance_tier_alloc_tracker(perf_tier_alloc_tracker);
     }
-
-
 
     return tiering_map;
 }
@@ -1136,9 +1026,6 @@ vdev_tiering_map_free(tiering_map_t *tiering_map) {
     list_destroy(&tiering_map->from_performance_tier_data_ranges);
     list_destroy(&tiering_map->to_capacity_tier_data_ranges);
 
-//    list_destroy(&tiering_map->prev_writes);
-
-
 
     kmem_free(tiering_map, sizeof(tiering_map_t));
 }
@@ -1153,6 +1040,9 @@ vdev_tiering_open(vdev_t *vd, u_int64_t *asize, u_int64_t *max_asize,
 
     /* TODO remove print statement */
     zfs_dbgmsg("Inside of vdev_tiering_open");
+
+    /* TODO remove, for analysis and debugging */
+    memset(bsize_by_txg, 0, sizeof(bsize_by_txg));
 
     /* Check that there is one vdev for tiering */
     if(vd->vdev_children != 1) {
@@ -1253,6 +1143,7 @@ vdev_tiering_open(vdev_t *vd, u_int64_t *asize, u_int64_t *max_asize,
     return tiering_map == NULL;
 }
 
+
 static void
 vdev_tiering_close(vdev_t *vd)
 {
@@ -1260,6 +1151,17 @@ vdev_tiering_close(vdev_t *vd)
 
     /* TODO remove print statement */
     zfs_dbgmsg("Inside of %s", __FUNCTION__ );
+
+    /* TODO remove, for analysis and debugging */
+    {
+        for(int txg=0; txg<(sizeof(bsize_by_txg)/sizeof(bsize_by_txg[0])); txg++) {
+            for(int bucket_idx = 0; bucket_idx<NUM_BLOCK_SIZES; bucket_idx++) {
+                if(bsize_by_txg[txg][bucket_idx] != 0) {
+                    zfs_dbgmsg("txg: %d bsize: %lld count: %d", txg, block_alloc_dist[bucket_idx].size, bsize_by_txg[txg][bucket_idx]);
+                }
+            }
+        }
+    }
 
     /* Iterate over the child vdevs and close them */
     for (int c = 0; c < vd->vdev_children; c++) {
@@ -1287,9 +1189,13 @@ vdev_tiering_close(vdev_t *vd)
 static void
 vdev_tiering_performance_write_child_done(zio_t *zio) {
 
-
     /* TODO remove print statement */
     vdev_dbgmsg(zio->io_spa->spa_root_vdev, "Inside of %s", __FUNCTION__);
+
+    /* TODO handle errors */
+    ASSERT(zio->io_error == 0);
+
+
 
     /* Get access to the data range entry and transfer ownership of the
      * data_range */
@@ -1306,11 +1212,9 @@ vdev_tiering_performance_write_child_done(zio_t *zio) {
     /* TODO remove mapping if it fails */
 
     /* Remove the local reference to the data range */
-    /*int64_t refcount = */zfs_refcount_remove(&data_range->refcount, FTAG);
+    zfs_refcount_remove(&data_range->refcount, FTAG);
 
-//    if(refcount == 0) {
-//        data_range_destroy(data_range);
-//    }
+    data_range_reference_change(data_range);
 
 //    zio_execute(zio->io_private);
 
@@ -1347,6 +1251,7 @@ vdev_tiering_performance_read_child_done(zio_t *zio) {
     //vdev_dbgmsg(zio->io_vd, "Inside of vdev_tiering_performance_read_child_done");
 
     /* TODO handle error */
+    ASSERT(zio->io_error == 0);
 
     /* Get access to the data range entry and transfer ownership to this function */
     data_range_t *data_range = zio->io_private;
@@ -1358,9 +1263,6 @@ vdev_tiering_performance_read_child_done(zio_t *zio) {
     zfs_refcount_remove(&data_range->refcount, FTAG);
 
     data_range_reference_change(data_range);
-//    if(refcount == 0) {
-//        data_range_destroy(data_range);
-//    }
 }
 
 
@@ -1369,6 +1271,7 @@ static void
 vdev_tiering_capacity_allocate_child_done(zio_t *zio) {
     zfs_dbgmsg("Inside of %s", __FUNCTION__);
 
+    ASSERT(zio->io_error == 0);
 
     /* Get access to the data range entry and transfer ownership to this function */
     data_range_t *data_range = zio->io_private;
@@ -1405,7 +1308,10 @@ static void
 vdev_tiering_capacity_read_child_done(zio_t *zio) {
     vdev_dbgmsg(zio->io_vd, "Inside of %s", __FUNCTION__);
 
+    ASSERT(zio->io_error == 0);
 }
+
+
 
 static void
 vdev_tiering_io_start(zio_t *zio) {
@@ -1415,7 +1321,6 @@ vdev_tiering_io_start(zio_t *zio) {
 //    kmutex_t *lock = &tiering_map->tiering_migration_thr_lock;
     //vdev_t *vd;
     data_range_t *data_range = NULL;
-
 
     /* TODO remove print statement */
     vdev_dbgmsg(zio->io_vd, "Inside of vdev_tiering_io_start, tiering_map = %p", tiering_map);
@@ -1440,6 +1345,10 @@ vdev_tiering_io_start(zio_t *zio) {
 
             /* On the performance tier */
             if(data_range != NULL) {
+
+                zfs_refcount_transfer_ownership(&data_range->refcount,
+                                    performance_tier_alloc_tracker_find_mapping,
+                                    FTAG);
 
                 spa_t *perf_spa = tiering_map->performance_vdev->vdev_spa;
 
@@ -1471,21 +1380,18 @@ vdev_tiering_io_start(zio_t *zio) {
                 zio_t * nop_zio = zio_null(zio,
                                            zio->io_spa,
                                            tiering_map->capacity_vdev,
-                                           vdev_tiering_capacity_read_child_done,
+                                           NULL,
                                            NULL,
                                            ZIO_FLAG_CANFAIL);
-
 
                 zio_add_child(zio, nop_zio);
 
                 zio_nowait(nop_zio);
 
                 /* Remove the local reference to the data range */
-                int64_t refcount = zfs_refcount_remove(&data_range->refcount, FTAG);
+                zfs_refcount_remove(&data_range->refcount, FTAG);
 
-                if(refcount == 0) {
-                    data_range_destroy(data_range);
-                }
+                data_range_reference_change(data_range);
 
             /* On the capacity tier */
             } else {
@@ -1506,62 +1412,6 @@ vdev_tiering_io_start(zio_t *zio) {
 
             }
 
-
-
-            /* TODO currently reads only happen on the slow tier, once we
-             * have data migration working then we need to select where to read
-             * from */
-
-//            if(zio->io_size < 8192) {
-//                vd = tiering_map->performance_vdev;
-//            } else {
-//            vd = tiering_map->capacity_vdev;
-//            }
-//
-            /* Schedule a read on the capacity tier */
-//            zio_nowait(
-//                    zio_vdev_child_io(zio, zio->io_bp, vd,
-//                                      zio->io_offset, zio->io_abd, zio->io_size,
-//                                      zio->io_type, zio->io_priority, 0,
-//                                      vdev_tiering_capacity_read_child_done,
-//                                      tiering_map));
-
-//            spa_t *perf_spa = tiering_map->performance_vdev->vdev_spa;
-//
-//            spa_config_enter(perf_spa, SCL_ALL, FTAG, RW_READER);
-//
-//            /* Do the read off the physical tier now and fill in the parents
-//             * abd buffer */
-//            zio_wait(
-//                    zio_read_phys(NULL,
-//                                  tiering_map->performance_vdev->vdev_child[0],
-//                                  zio->io_offset,
-//                                  zio->io_size,
-//                                  zio->io_abd,
-//                                  ZIO_CHECKSUM_OFF,
-//                                  vdev_tiering_performance_read_child_done,
-//                                  tiering_map,
-//                                  zio->io_priority,
-//                                  ZIO_FLAG_CANFAIL,
-//                                  B_FALSE));
-//
-//            spa_config_exit(perf_spa, SCL_ALL, FTAG);
-//
-//
-//            /* Create a child nop and use that to signal the parent that it is
-//             * done */
-//            zio_t * nop_zio = zio_null(zio,
-//                                       zio->io_spa,
-//                                       vd,
-//                                       vdev_tiering_capacity_read_child_done,
-//                                       tiering_map,
-//                                 ZIO_FLAG_CANFAIL);
-//
-//
-//            zio_add_child(zio, nop_zio);
-//
-//            zio_nowait(nop_zio);
-
             /* Execute zio */
             zio_execute(zio);
 
@@ -1575,44 +1425,20 @@ vdev_tiering_io_start(zio_t *zio) {
            vdev_dbgmsg(zio->io_vd, "vdev_tiering_io_start write op txg: %d offset: %llu length: %llu flags: %d",
                     zio->io_txg, zio->io_offset, zio->io_size, zio->io_flags);
 
-
            /* TODO this is only the base case of a write, need to handle more
             * complex cases like reslivering and scrubs */
-
-//           u_int64_t perf_offset = -1;
-//           u_int64_t perf_size = zio->io_size;
-
-//           while(perf_offset == (u_int64_t) -1) {
-               data_range = performance_tier_alloc_tracker_get_block(
-                       tiering_map->perf_tier_alloc_tracker, tiering_map,
-                       zio->io_bp, zio->io_offset, zio->io_size);
+           data_range = performance_tier_alloc_tracker_get_block(
+                   tiering_map->perf_tier_alloc_tracker, tiering_map,
+                   zio->io_bp, zio->io_offset, zio->io_size);
 
 
-
-            zfs_refcount_transfer_ownership(&data_range->refcount,
-                                             performance_tier_alloc_tracker_get_block,
-                                             FTAG);
-//
-//
-//               if(perf_offset == (u_int64_t) -1) {
-//                   address_map_release_mappings(tiering_map->address_map);
-//               }
-//           }
-
-           /* Create a data range and add it to the list of data ranges for
-            * later migration (Need to capture this information here because
-            * the child io will shift the offset within zio of the callback */
-//           data_range = data_range_create(tiering_map, zio->io_offset,
-//                                          zio->io_size,perf_offset,
-//                                          perf_size, zio,
-//                                          tiering_map->perf_tier_alloc_tracker);
-
+           zfs_refcount_transfer_ownership(&data_range->refcount,
+                                           performance_tier_alloc_tracker_get_block,
+                                           FTAG);
 
            data_range->orig_zio = zio;
            data_range->databuf = zio->io_abd;
            data_range->blkptr = *zio->io_bp;
-
-
 
            zio->io_prop.zp_copies = 1;
 
@@ -1691,7 +1517,6 @@ vdev_tiering_io_start(zio_t *zio) {
 
 
             /* Create a child vdev io that only allocates on the capacity tier */
-
             zio_t *cap_zio = zio_vdev_child_io(zio,
                                                zio->io_bp,
                                                tiering_map->capacity_vdev,
