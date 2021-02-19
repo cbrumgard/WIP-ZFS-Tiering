@@ -6,7 +6,6 @@
  *  UCRL-CODE-235197
  *
  *  This file is part of the SPL, Solaris Porting Layer.
- *  For details, see <http://zfsonlinux.org/>.
  *
  *  The SPL is free software; you can redistribute it and/or modify it
  *  under the terms of the GNU General Public License as published by the
@@ -26,6 +25,15 @@
 #define	_SPL_BYTEORDER_H
 
 #include <asm/byteorder.h>
+
+#if defined(__BIG_ENDIAN) && !defined(_ZFS_BIG_ENDIAN)
+#define	_ZFS_BIG_ENDIAN
+#endif
+
+#if defined(__LITTLE_ENDIAN) && !defined(_ZFS_LITTLE_ENDIAN)
+#define	_ZFS_LITTLE_ENDIAN
+#endif
+
 #include <sys/isa_defs.h>
 
 #define	BSWAP_8(x)	((x) & 0xff)
@@ -49,7 +57,7 @@
 #define	BE_IN32(xa) \
 	(((uint32_t)BE_IN16(xa) << 16) | BE_IN16((uint8_t *)(xa)+2))
 
-#ifdef _BIG_ENDIAN
+#ifdef _ZFS_BIG_ENDIAN
 static __inline__ uint64_t
 htonll(uint64_t n)
 {

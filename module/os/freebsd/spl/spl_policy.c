@@ -27,6 +27,7 @@
 #include <sys/cdefs.h>
 __FBSDID("$FreeBSD$");
 
+#include <sys/types.h>
 #include <sys/param.h>
 #include <sys/priv.h>
 #include <sys/vnode.h>
@@ -36,6 +37,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/jail.h>
 #include <sys/policy.h>
 #include <sys/zfs_vfsops.h>
+#include <sys/zfs_znode.h>
 
 
 int
@@ -47,6 +49,13 @@ secpolicy_nfs(cred_t *cr)
 
 int
 secpolicy_zfs(cred_t *cr)
+{
+
+	return (spl_priv_check_cred(cr, PRIV_VFS_MOUNT));
+}
+
+int
+secpolicy_zfs_proc(cred_t *cr, proc_t *proc)
 {
 
 	return (spl_priv_check_cred(cr, PRIV_VFS_MOUNT));
@@ -304,11 +313,11 @@ secpolicy_vnode_setids_setgids(vnode_t *vp, cred_t *cr, gid_t gid)
 }
 
 int
-secpolicy_vnode_setid_retain(vnode_t *vp, cred_t *cr,
+secpolicy_vnode_setid_retain(znode_t *zp, cred_t *cr,
     boolean_t issuidroot __unused)
 {
 
-	if (secpolicy_fs_owner(vp->v_mount, cr) == 0)
+	if (secpolicy_fs_owner(ZTOV(zp)->v_mount, cr) == 0)
 		return (0);
 	return (spl_priv_check_cred(cr, PRIV_VFS_RETAINSUGID));
 }

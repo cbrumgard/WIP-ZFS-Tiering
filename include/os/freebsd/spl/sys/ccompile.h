@@ -48,6 +48,7 @@ extern "C" {
 
 #if defined(__ATTRIBUTE_IMPLEMENTED) || defined(__GNUC__)
 
+#if 0
 /*
  * analogous to lint's PRINTFLIKEn
  */
@@ -56,27 +57,34 @@ extern "C" {
 #define	__sun_attr___VPRINTFLIKE__(__n)	\
 		__attribute__((__format__(printf, __n, 0)))
 
-/*
- * Handle the kernel printf routines that can take '%b' too
- */
-#if __GNUC_VERSION < 30402
-/*
- * XX64 at least this doesn't work correctly yet with 3.4.1 anyway!
- */
 #define	__sun_attr___KPRINTFLIKE__	__sun_attr___PRINTFLIKE__
 #define	__sun_attr___KVPRINTFLIKE__	__sun_attr___VPRINTFLIKE__
 #else
-#define	__sun_attr___KPRINTFLIKE__(__n)	\
-		__attribute__((__format__(cmn_err, __n, (__n)+1)))
-#define	__sun_attr___KVPRINTFLIKE__(__n) \
-		__attribute__((__format__(cmn_err, __n, 0)))
+/*
+ * Currently the openzfs codebase has a lot of formatting errors
+ * which are not picked up in the linux build because they're not
+ * doing formatting checks. LLVM's kprintf implementation doesn't
+ * actually do format checks!
+ *
+ * For FreeBSD these break under gcc! LLVM shim'ed cmn_err as a
+ * format attribute but also didn't check anything.  If one
+ * replaces it with the above, all of the format issues
+ * in the codebase show up.
+ *
+ * Once those format string issues are addressed, the above
+ * should be flipped on once again.
+ */
+#define	__sun_attr___PRINTFLIKE__(__n)
+#define	__sun_attr___VPRINTFLIKE__(__n)
+#define	__sun_attr___KPRINTFLIKE__(__n)
+#define	__sun_attr___KVPRINTFLIKE__(__n)
+
 #endif
 
 /*
  * This one's pretty obvious -- the function never returns
  */
 #define	__sun_attr___noreturn__ __attribute__((__noreturn__))
-
 
 /*
  * This is an appropriate label for functions that do not
@@ -113,15 +121,17 @@ extern "C" {
 #define	__VPRINTFLIKE(__n)	__sun_attr__((__VPRINTFLIKE__(__n)))
 #define	__KPRINTFLIKE(__n)	__sun_attr__((__KPRINTFLIKE__(__n)))
 #define	__KVPRINTFLIKE(__n)	__sun_attr__((__KVPRINTFLIKE__(__n)))
-#ifdef _KERNEL
+#if	defined(_KERNEL) || defined(_STANDALONE)
 #define	__NORETURN		__sun_attr__((__noreturn__))
-#endif
+#endif /* _KERNEL || _STANDALONE */
 #define	__CONST			__sun_attr__((__const__))
 #define	__PURE			__sun_attr__((__pure__))
 
-#if (defined(ZFS_DEBUG) || !defined(NDEBUG))&& !defined(DEBUG)
-#define	DEBUG
+#if defined(INVARIANTS) && !defined(ZFS_DEBUG)
+#define	ZFS_DEBUG
+#undef 	NDEBUG
 #endif
+
 #define	EXPORT_SYMBOL(x)
 #define	MODULE_AUTHOR(s)
 #define	MODULE_DESCRIPTION(s)
@@ -133,6 +143,9 @@ extern "C" {
 #define	asm __asm
 #ifdef ZFS_DEBUG
 #undef NDEBUG
+#endif
+#if !defined(ZFS_DEBUG) && !defined(NDEBUG)
+#define	NDEBUG
 #endif
 
 #ifndef EINTEGRITY
@@ -153,18 +166,19 @@ extern "C" {
 #define	ECHRNG ENXIO
 #define	ETIME ETIMEDOUT
 
-#define	O_LARGEFILE 0
-#define	O_RSYNC 0
-#define	O_DSYNC 0
+#ifndef LOCORE
+#ifndef HAVE_RPC_TYPES
+typedef int bool_t;
+typedef int enum_t;
+#endif
+#endif
 
-#define	KMALLOC_MAX_SIZE MAXPHYS
+#ifndef __cplusplus
+#define	__init
+#define	__exit
+#endif
 
-#ifdef _KERNEL
-typedef unsigned long long	u_longlong_t;
-typedef long long		longlong_t;
-
-#include <linux/types.h>
-typedef	void zfs_kernel_param_t;
+#if defined(_KERNEL) || defined(_STANDALONE)
 #define	param_set_charp(a, b) (0)
 #define	ATTR_UID AT_UID
 #define	ATTR_GID AT_GID
@@ -173,131 +187,19 @@ typedef	void zfs_kernel_param_t;
 #define	ATTR_CTIME	AT_CTIME
 #define	ATTR_MTIME	AT_MTIME
 #define	ATTR_ATIME	AT_ATIME
+#if defined(_STANDALONE)
+#define	vmem_free kmem_free
+#define	vmem_zalloc kmem_zalloc
+#define	vmem_alloc kmem_zalloc
+#else
 #define	vmem_free zfs_kmem_free
 #define	vmem_zalloc(size, flags) zfs_kmem_alloc(size, flags | M_ZERO)
 #define	vmem_alloc zfs_kmem_alloc
+#endif
 #define	MUTEX_NOLOCKDEP 0
 #define	RW_NOLOCKDEP 0
 
-
-#if  __FreeBSD_version < 1300051
-#define	vm_page_valid(m) (m)->valid = VM_PAGE_BITS_ALL
-#define	vm_page_do_sunbusy(m)
-#define	vm_page_none_valid(m) ((m)->valid == 0)
 #else
-#define	vm_page_do_sunbusy(m) vm_page_sunbusy(m)
-#endif
-
-#if  __FreeBSD_version < 1300074
-#define	VOP_UNLOCK1(x)	VOP_UNLOCK(x, 0)
-#else
-#define	VOP_UNLOCK1(x)	VOP_UNLOCK(x)
-#endif
-
-#if  __FreeBSD_version < 1300064
-#define	VN_IS_DOOMED(vp)	((vp)->v_iflag & VI_DOOMED)
-#endif
-
-#if  __FreeBSD_version < 1300068
-#define	VFS_VOP_VECTOR_REGISTER(x)
-#endif
-
-#if  __FreeBSD_version >= 1300076
-#define	getnewvnode_reserve_()	getnewvnode_reserve()
-#else
-#define	getnewvnode_reserve_()	getnewvnode_reserve(1)
-#endif
-
-struct hlist_node {
-	struct hlist_node *next, **pprev;
-};
-
-struct hlist_head {
-	struct hlist_node *first;
-};
-
-typedef struct {
-	volatile int counter;
-} atomic_t;
-
-	/* BEGIN CSTYLED */
-#define	hlist_for_each(p, head)                                      \
-	for (p = (head)->first; p; p = (p)->next)
-
-#define	hlist_entry(ptr, type, field)   container_of(ptr, type, field)
-
-#define	container_of(ptr, type, member)                         \
-({                                                              \
-        const __typeof(((type *)0)->member) *__p = (ptr);       \
-        (type *)((uintptr_t)__p - offsetof(type, member));      \
-})
-	/* END CSTYLED */
-
-static inline void
-hlist_add_head(struct hlist_node *n, struct hlist_head *h)
-{
-	n->next = h->first;
-	if (h->first != NULL)
-		h->first->pprev = &n->next;
-	WRITE_ONCE(h->first, n);
-	n->pprev = &h->first;
-}
-
-static inline void
-hlist_del(struct hlist_node *n)
-{
-	WRITE_ONCE(*(n->pprev), n->next);
-	if (n->next != NULL)
-		n->next->pprev = n->pprev;
-}
-	/* BEGIN CSTYLED */
-#define	READ_ONCE(x) ({			\
-	__typeof(x) __var = ({		\
-		barrier();		\
-		ACCESS_ONCE(x);		\
-	});				\
-	barrier();			\
-	__var;				\
-})
-
-#define	HLIST_HEAD_INIT { }
-#define	HLIST_HEAD(name) struct hlist_head name = HLIST_HEAD_INIT
-#define	INIT_HLIST_HEAD(head) (head)->first = NULL
-
-#define	INIT_HLIST_NODE(node)					\
-	do {																\
-		(node)->next = NULL;											\
-		(node)->pprev = NULL;											\
-	} while (0)
-
-/* END CSTYLED */
-static inline int
-atomic_read(const atomic_t *v)
-{
-	return (READ_ONCE(v->counter));
-}
-
-static inline int
-atomic_inc(atomic_t *v)
-{
-	return (atomic_fetchadd_int(&v->counter, 1) + 1);
-}
-
-static inline int
-atomic_dec(atomic_t *v)
-{
-	return (atomic_fetchadd_int(&v->counter, -1) - 1);
-}
-
-#else
-typedef long loff_t;
-typedef long rlim64_t;
-typedef int bool_t;
-typedef int enum_t;
-#ifndef __cplusplus
-#define	__init
-#endif
-#define	__exit
 #define	FALSE 0
 #define	TRUE 1
 	/*
@@ -308,10 +210,15 @@ typedef int enum_t;
 #define	ENODATA EINVAL
 
 
-#define	__XSI_VISIBLE 1000
 #define	__BSD_VISIBLE 1
+#ifndef	IN_BASE
 #define	__POSIX_VISIBLE 201808
+#define	__XSI_VISIBLE 1000
+#endif
 #define	ARRAY_SIZE(a) (sizeof (a) / sizeof (a[0]))
+#define	mmap64 mmap
+/* Note: this file can be used on linux/macOS when bootstrapping tools. */
+#if defined(__FreeBSD__)
 #define	open64 open
 #define	pwrite64 pwrite
 #define	ftruncate64 ftruncate
@@ -322,6 +229,7 @@ typedef int enum_t;
 #define	statfs64 statfs
 #define	readdir64 readdir
 #define	dirent64 dirent
+#endif
 #define	P2ALIGN(x, align)		((x) & -(align))
 #define	P2CROSS(x, y, align)	(((x) ^ (y)) > (align) - 1)
 #define	P2ROUNDUP(x, align)		((((x) - 1) | ((align) - 1)) + 1)
@@ -363,7 +271,9 @@ typedef int enum_t;
 
 #define	DIV_ROUND_UP(n, d)	(((n) + (d) - 1) / (d))
 #define	RLIM64_INFINITY RLIM_INFINITY
+#ifndef HAVE_ERESTART
 #define	ERESTART EAGAIN
+#endif
 #define	ABS(a)	((a) < 0 ? -(a) : (a))
 
 #endif

@@ -22,11 +22,13 @@
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright 2011 Nexenta Systems, Inc. All rights reserved.
- * Copyright (c) 2011, 2018 by Delphix. All rights reserved.
+ * Copyright (c) 2011, 2020 by Delphix. All rights reserved.
  * Copyright 2017 Joyent, Inc.
+ * Copyright (c) 2021, Colm Buckley <colm@tuatha.org>
  */
 
 #include <sys/spa.h>
+#include <sys/file.h>
 #include <sys/fm/fs/zfs.h>
 #include <sys/spa_impl.h>
 #include <sys/nvpair.h>
@@ -99,6 +101,10 @@ spa_config_load(void)
 
 	err = zfs_file_open(pathname, O_RDONLY, 0, &fp);
 
+#ifdef __FreeBSD__
+	if (err)
+		err = zfs_file_open(ZPOOL_CACHE_BOOT, O_RDONLY, 0, &fp);
+#endif
 	kmem_free(pathname, MAXPATHLEN);
 
 	if (err)
@@ -309,8 +315,9 @@ spa_write_cachefile(spa_t *target, boolean_t removing, boolean_t postsysevent)
 		 * resource issues are resolved.
 		 */
 		if (target->spa_ccw_fail_time == 0) {
-			zfs_ereport_post(FM_EREPORT_ZFS_CONFIG_CACHE_WRITE,
-			    target, NULL, NULL, NULL, 0, 0);
+			(void) zfs_ereport_post(
+			    FM_EREPORT_ZFS_CONFIG_CACHE_WRITE,
+			    target, NULL, NULL, NULL, 0);
 		}
 		target->spa_ccw_fail_time = gethrtime();
 		spa_async_request(target, SPA_ASYNC_CONFIG_UPDATE);
@@ -440,6 +447,9 @@ spa_config_generate(spa_t *spa, vdev_t *vd, uint64_t txg, int getstats)
 	if (spa->spa_comment != NULL)
 		fnvlist_add_string(config, ZPOOL_CONFIG_COMMENT,
 		    spa->spa_comment);
+	if (spa->spa_compatibility != NULL)
+		fnvlist_add_string(config, ZPOOL_CONFIG_COMPATIBILITY,
+		    spa->spa_compatibility);
 
 	hostid = spa_get_hostid(spa);
 	if (hostid != 0)

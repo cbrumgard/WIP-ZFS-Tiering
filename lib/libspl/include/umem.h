@@ -36,6 +36,7 @@
  *
  * https://labs.omniti.com/trac/portableumem
  */
+#include <sys/debug.h>
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -56,10 +57,7 @@ typedef void vmem_t;
 /*
  * Flags for umem_cache_create()
  */
-#define	UMC_NOTOUCH		0x00010000
 #define	UMC_NODEBUG		0x00020000
-#define	UMC_NOMAGAZINE		0x00040000
-#define	UMC_NOHASH		0x00080000
 
 #define	UMEM_CACHE_NAMELEN	31
 
@@ -131,13 +129,13 @@ umem_zalloc(size_t size, int flags)
 }
 
 static inline void
-umem_free(void *ptr, size_t size)
+umem_free(void *ptr, size_t size __maybe_unused)
 {
 	free(ptr);
 }
 
 static inline void
-umem_nofail_callback(umem_nofail_callback_t *cb)
+umem_nofail_callback(umem_nofail_callback_t *cb __maybe_unused)
 {}
 
 static inline umem_cache_t *
@@ -199,7 +197,7 @@ umem_cache_free(umem_cache_t *cp, void *ptr)
 }
 
 static inline void
-umem_cache_reap_now(umem_cache_t *cp)
+umem_cache_reap_now(umem_cache_t *cp __maybe_unused)
 {
 }
 

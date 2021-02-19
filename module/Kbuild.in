@@ -9,6 +9,7 @@ ZFS_MODULES += nvpair/
 ZFS_MODULES += unicode/
 ZFS_MODULES += zcommon/
 ZFS_MODULES += zfs/
+ZFS_MODULES += zstd/
 
 # The rest is only relevant when run by kbuild
 ifneq ($(KERNELRELEASE),)
@@ -22,6 +23,7 @@ ZFS_MODULE_CFLAGS += @KERNEL_DEBUG_CFLAGS@  @NO_FORMAT_ZERO_LENGTH@
 ifneq ($(KBUILD_EXTMOD),)
 zfs_include = @abs_top_srcdir@/include
 ZFS_MODULE_CFLAGS += -include @abs_top_builddir@/zfs_config.h
+ZFS_MODULE_CFLAGS += -I@abs_top_builddir@/include
 else
 zfs_include = $(srctree)/include/zfs
 ZFS_MODULE_CFLAGS += -include $(zfs_include)/zfs_config.h

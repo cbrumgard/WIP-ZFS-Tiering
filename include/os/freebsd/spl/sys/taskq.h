@@ -26,10 +26,13 @@
 #ifndef	_SYS_TASKQ_H
 #define	_SYS_TASKQ_H
 
+#ifdef _KERNEL
+
 #include <sys/types.h>
 #include <sys/proc.h>
 #include <sys/taskqueue.h>
 #include <sys/thread.h>
+#include <sys/ck.h>
 
 #ifdef	__cplusplus
 extern "C" {
@@ -37,25 +40,25 @@ extern "C" {
 
 #define	TASKQ_NAMELEN	31
 
-struct taskqueue;
-struct taskq {
+typedef struct taskq {
 	struct taskqueue	*tq_queue;
-};
+} taskq_t;
 
-typedef struct taskq taskq_t;
 typedef uintptr_t taskqid_t;
 typedef void (task_func_t)(void *);
 
 typedef struct taskq_ent {
 	struct task	 tqent_task;
+	struct timeout_task tqent_timeout_task;
 	task_func_t	*tqent_func;
 	void		*tqent_arg;
-	struct timeout_task tqent_timeout_task;
-	int tqent_type;
-	int tqent_gen;
+	taskqid_t tqent_id;
+	CK_LIST_ENTRY(taskq_ent) tqent_hash;
+	uint8_t tqent_type;
+	uint8_t tqent_registered;
+	uint8_t tqent_cancelled;
+	volatile uint32_t tqent_rc;
 } taskq_ent_t;
-
-struct proc;
 
 /*
  * Public flags for taskq_create(): bit range 0-15
@@ -110,5 +113,12 @@ void	taskq_resume(taskq_t *);
 #ifdef	__cplusplus
 }
 #endif
+
+#endif /* _KERNEL */
+
+#ifdef _STANDALONE
+typedef int taskq_ent_t;
+#define	taskq_init_ent(x)
+#endif /* _STANDALONE */
 
 #endif	/* _SYS_TASKQ_H */

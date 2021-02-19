@@ -33,6 +33,12 @@
 #include <sys/stat.h>
 #include <sys/param.h>
 
+#ifdef IN_BASE
+#define	ZFS_KMOD	"zfs"
+#else
+#define	ZFS_KMOD	"openzfs"
+#endif
+
 void
 libzfs_set_pipe_max(int infd)
 {
@@ -170,11 +176,26 @@ execvpe(const char *name, char * const argv[], char * const envp[])
 	return (execvPe(name, path, argv, envp));
 }
 
+#define	ERRBUFLEN 256
+
+static __thread char errbuf[ERRBUFLEN];
+
 const char *
 libzfs_error_init(int error)
 {
+	char *msg = errbuf;
+	size_t len, msglen = ERRBUFLEN;
 
-	return (strerror(error));
+	if (modfind("zfs") < 0) {
+		len = snprintf(msg, msglen, dgettext(TEXT_DOMAIN,
+		    "Failed to load %s module: "), ZFS_KMOD);
+		msg += len;
+		msglen -= len;
+	}
+
+	(void) snprintf(msg, msglen, "%s", strerror(error));
+
+	return (errbuf);
 }
 
 int
@@ -187,18 +208,18 @@ zfs_ioctl(libzfs_handle_t *hdl, int request, zfs_cmd_t *zc)
  * Verify the required ZFS_DEV device is available and optionally attempt
  * to load the ZFS modules.  Under normal circumstances the modules
  * should already have been loaded by some external mechanism.
- *
- * Environment variables:
- * - ZFS_MODULE_LOADING="YES|yes|ON|on" - Attempt to load modules.
- * - ZFS_MODULE_TIMEOUT="<seconds>"     - Seconds to wait for ZFS_DEV
  */
 int
 libzfs_load_module(void)
 {
-	/* XXX: modname is "zfs" but file is named "openzfs". */
+	/*
+	 * XXX: kldfind(ZFS_KMOD) would be nice here, but we retain
+	 * modfind("zfs") so out-of-base openzfs userland works with the
+	 * in-base module.
+	 */
 	if (modfind("zfs") < 0) {
 		/* Not present in kernel, try loading it. */
-		if (kldload("openzfs") < 0 && errno != EEXIST) {
+		if (kldload(ZFS_KMOD) < 0 && errno != EEXIST) {
 			return (errno);
 		}
 	}
@@ -230,7 +251,7 @@ int
 zfs_jail(zfs_handle_t *zhp, int jailid, int attach)
 {
 	libzfs_handle_t *hdl = zhp->zfs_hdl;
-	zfs_cmd_t zc = { { 0 } };
+	zfs_cmd_t zc = {"\0"};
 	char errbuf[1024];
 	unsigned long cmd;
 	int ret;
@@ -268,10 +289,33 @@ zfs_jail(zfs_handle_t *zhp, int jailid, int attach)
 	zc.zc_zoneid = jailid;
 
 	cmd = attach ? ZFS_IOC_JAIL : ZFS_IOC_UNJAIL;
-	if ((ret = ioctl(hdl->libzfs_fd, cmd, &zc)) != 0)
+	if ((ret = zfs_ioctl(hdl, cmd, &zc)) != 0)
 		zfs_standard_error(hdl, errno, errbuf);
 
 	return (ret);
+}
+
+/*
+ * Set loader options for next boot.
+ */
+int
+zpool_nextboot(libzfs_handle_t *hdl, uint64_t pool_guid, uint64_t dev_guid,
+    const char *command)
+{
+	zfs_cmd_t zc = {"\0"};
+	nvlist_t *args;
+	int error;
+
+	args = fnvlist_alloc();
+	fnvlist_add_uint64(args, ZPOOL_CONFIG_POOL_GUID, pool_guid);
+	fnvlist_add_uint64(args, ZPOOL_CONFIG_GUID, dev_guid);
+	fnvlist_add_string(args, "command", command);
+	error = zcmd_write_src_nvlist(hdl, &zc, args);
+	if (error == 0)
+		error = zfs_ioctl(hdl, ZFS_IOC_NEXTBOOT, &zc);
+	zcmd_free_nvlists(&zc);
+	nvlist_free(args);
+	return (error);
 }
 
 /*

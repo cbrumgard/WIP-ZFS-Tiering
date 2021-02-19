@@ -41,6 +41,8 @@
 #include <sys/utsname.h>
 #include <sys/zfs_context.h>
 #include <sys/zfs_onexit.h>
+#include <sys/zfs_vfsops.h>
+#include <sys/zstd/zstd.h>
 #include <sys/zvol.h>
 #include <zfs_fletcher.h>
 #include <zlib.h>
@@ -52,7 +54,6 @@
 uint64_t physmem;
 char hw_serial[HW_HOSTID_LEN];
 struct utsname hw_utsname;
-vmem_t *zio_arena = NULL;
 
 /* If set, all blocks read will be copied to the specified directory. */
 char *vn_dumpdir = NULL;
@@ -443,6 +444,7 @@ seq_printf(struct seq_file *m, const char *fmt, ...)
 
 void
 procfs_list_install(const char *module,
+    const char *submodule,
     const char *name,
     mode_t mode,
     procfs_list_t *procfs_list,
@@ -837,6 +839,8 @@ kernel_init(int mode)
 	system_taskq_init();
 	icp_init();
 
+	zstd_init();
+
 	spa_init((spa_mode_t)mode);
 
 	fletcher_4_init();
@@ -849,6 +853,8 @@ kernel_fini(void)
 {
 	fletcher_4_fini();
 	spa_fini();
+
+	zstd_fini();
 
 	icp_fini();
 	system_taskq_fini();
@@ -906,6 +912,12 @@ zfs_secpolicy_destroy_perms(const char *name, cred_t *cr)
 
 int
 secpolicy_zfs(const cred_t *cr)
+{
+	return (0);
+}
+
+int
+secpolicy_zfs_proc(const cred_t *cr, proc_t *proc)
 {
 	return (0);
 }
@@ -1397,4 +1409,9 @@ void
 zfs_file_put(int fd)
 {
 	abort();
+}
+
+void
+zfsvfs_update_fromname(const char *oldname, const char *newname)
+{
 }

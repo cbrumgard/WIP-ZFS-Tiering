@@ -60,8 +60,9 @@
  * of names after deciding which is the appropriate lookup interface.
  */
 static int
-zfs_match_find(zfsvfs_t *zfsvfs, znode_t *dzp, char *name, matchtype_t mt,
-    boolean_t update, int *deflags, pathname_t *rpnp, uint64_t *zoid)
+zfs_match_find(zfsvfs_t *zfsvfs, znode_t *dzp, const char *name,
+    matchtype_t mt, boolean_t update, int *deflags, pathname_t *rpnp,
+    uint64_t *zoid)
 {
 	boolean_t conflict = B_FALSE;
 	int error;
@@ -139,8 +140,8 @@ zfs_match_find(zfsvfs_t *zfsvfs, znode_t *dzp, char *name, matchtype_t mt,
  *	 but return znode pointers to a single match.
  */
 int
-zfs_dirent_lock(zfs_dirlock_t **dlpp, znode_t *dzp, char *name, znode_t **zpp,
-    int flag, int *direntflags, pathname_t *realpnp)
+zfs_dirent_lock(zfs_dirlock_t **dlpp, znode_t *dzp, char *name,
+    znode_t **zpp, int flag, int *direntflags, pathname_t *realpnp)
 {
 	zfsvfs_t	*zfsvfs = ZTOZSB(dzp);
 	zfs_dirlock_t	*dl;
@@ -1059,7 +1060,7 @@ zfs_make_xattrdir(znode_t *zp, vattr_t *vap, znode_t **xzpp, cred_t *cr)
 	int error;
 	zfs_acl_ids_t acl_ids;
 	boolean_t fuid_dirtied;
-#ifdef DEBUG
+#ifdef ZFS_DEBUG
 	uint64_t parent;
 #endif
 
@@ -1095,7 +1096,7 @@ zfs_make_xattrdir(znode_t *zp, vattr_t *vap, znode_t **xzpp, cred_t *cr)
 	if (fuid_dirtied)
 		zfs_fuid_sync(zfsvfs, tx);
 
-#ifdef DEBUG
+#ifdef ZFS_DEBUG
 	error = sa_lookup(xzp->z_sa_hdl, SA_ZPL_PARENT(zfsvfs),
 	    &parent, sizeof (parent));
 	ASSERT(error == 0 && parent == zp->z_id);

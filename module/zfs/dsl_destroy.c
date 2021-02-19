@@ -600,26 +600,21 @@ dsl_destroy_snapshots_nvl(nvlist_t *snaps, boolean_t defer,
 	/*
 	 * lzc_destroy_snaps() is documented to take an nvlist whose
 	 * values "don't matter".  We need to convert that nvlist to
-	 * one that we know can be converted to LUA. We also don't
-	 * care about any duplicate entries because the nvlist will
-	 * be converted to a LUA table which should take care of this.
+	 * one that we know can be converted to LUA.
 	 */
-	nvlist_t *snaps_normalized;
-	VERIFY0(nvlist_alloc(&snaps_normalized, 0, KM_SLEEP));
+	nvlist_t *snaps_normalized = fnvlist_alloc();
 	for (nvpair_t *pair = nvlist_next_nvpair(snaps, NULL);
 	    pair != NULL; pair = nvlist_next_nvpair(snaps, pair)) {
 		fnvlist_add_boolean_value(snaps_normalized,
 		    nvpair_name(pair), B_TRUE);
 	}
 
-	nvlist_t *arg;
-	VERIFY0(nvlist_alloc(&arg, 0, KM_SLEEP));
+	nvlist_t *arg = fnvlist_alloc();
 	fnvlist_add_nvlist(arg, "snaps", snaps_normalized);
 	fnvlist_free(snaps_normalized);
 	fnvlist_add_boolean_value(arg, "defer", defer);
 
-	nvlist_t *wrapper;
-	VERIFY0(nvlist_alloc(&wrapper, 0, KM_SLEEP));
+	nvlist_t *wrapper = fnvlist_alloc();
 	fnvlist_add_nvlist(wrapper, ZCP_ARG_ARGLIST, arg);
 	fnvlist_free(arg);
 
@@ -654,7 +649,7 @@ dsl_destroy_snapshots_nvl(nvlist_t *snaps, boolean_t defer,
 	    B_TRUE,
 	    0,
 	    zfs_lua_max_memlimit,
-	    nvlist_next_nvpair(wrapper, NULL), result);
+	    fnvlist_lookup_nvpair(wrapper, ZCP_ARG_ARGLIST), result);
 	if (error != 0) {
 		char *errorstr = NULL;
 		(void) nvlist_lookup_string(result, ZCP_RET_ERROR, &errorstr);
@@ -737,6 +732,10 @@ static void
 old_synchronous_dataset_destroy(dsl_dataset_t *ds, dmu_tx_t *tx)
 {
 	struct killarg ka;
+
+	spa_history_log_internal_ds(ds, "destroy", tx,
+	    "(synchronous, mintxg=%llu)",
+	    (long long)dsl_dataset_phys(ds)->ds_prev_snap_txg);
 
 	/*
 	 * Free everything that we point to (that's born after
@@ -902,6 +901,14 @@ dsl_async_clone_destroy(dsl_dataset_t *ds, dmu_tx_t *tx)
 	spa_t *spa = dmu_tx_pool(tx)->dp_spa;
 	VERIFY0(dmu_objset_from_ds(ds, &os));
 
+	uint64_t mintxg = 0;
+	dsl_deadlist_entry_t *dle = dsl_deadlist_first(&dd->dd_livelist);
+	if (dle != NULL)
+		mintxg = dle->dle_mintxg;
+
+	spa_history_log_internal_ds(ds, "destroy", tx,
+	    "(livelist, mintxg=%llu)", (long long)mintxg);
+
 	/* Check that the clone is in a correct state to be deleted */
 	dsl_clone_destroy_assert(dd);
 
@@ -922,7 +929,7 @@ dsl_async_clone_destroy(dsl_dataset_t *ds, dmu_tx_t *tx)
 		spa->spa_livelists_to_delete = zap_obj;
 	} else if (error != 0) {
 		zfs_panic_recover("zfs: error %d was returned while looking "
-		    "up DMU_POOL_DELETED_CLONES in the zap");
+		    "up DMU_POOL_DELETED_CLONES in the zap", error);
 		return;
 	}
 	VERIFY0(zap_add_int(mos, zap_obj, to_delete, tx));
@@ -951,6 +958,10 @@ dsl_async_dataset_destroy(dsl_dataset_t *ds, dmu_tx_t *tx)
 	VERIFY0(dmu_objset_from_ds(ds, &os));
 	dsl_pool_t *dp = dmu_tx_pool(tx);
 	objset_t *mos = dp->dp_meta_objset;
+
+	spa_history_log_internal_ds(ds, "destroy", tx,
+	    "(bptree, mintxg=%llu)",
+	    (long long)dsl_dataset_phys(ds)->ds_prev_snap_txg);
 
 	zil_destroy_sync(dmu_objset_zil(os), tx);
 
@@ -1002,9 +1013,6 @@ dsl_destroy_head_sync_impl(dsl_dataset_t *ds, dmu_tx_t *tx)
 	ASSERT3U(dsl_dataset_phys(ds)->ds_bp.blk_birth, <=, tx->tx_txg);
 	rrw_exit(&ds->ds_bp_rwlock, FTAG);
 	ASSERT(RRW_WRITE_HELD(&dp->dp_config_rwlock));
-
-	/* We need to log before removing it from the namespace. */
-	spa_history_log_internal_ds(ds, "destroy", tx, " ");
 
 	dsl_dir_cancel_waiters(ds->ds_dir);
 

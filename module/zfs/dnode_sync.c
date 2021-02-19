@@ -21,8 +21,9 @@
 
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2012, 2018 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2020 by Delphix. All rights reserved.
  * Copyright (c) 2014 Spectra Logic Corporation, All rights reserved.
+ * Copyright 2020 Oxide Computer Company
  */
 
 #include <sys/zfs_context.h>
@@ -91,7 +92,7 @@ dnode_increase_indirection(dnode_t *dn, dmu_tx_t *tx)
 
 		if (child == NULL)
 			continue;
-#ifdef	DEBUG
+#ifdef	ZFS_DEBUG
 		DB_DNODE_ENTER(child);
 		ASSERT3P(DB_DNODE(child), ==, dn);
 		DB_DNODE_EXIT(child);
@@ -462,7 +463,7 @@ dnode_evict_dbufs(dnode_t *dn)
 	mutex_enter(&dn->dn_dbufs_mtx);
 	for (db = avl_first(&dn->dn_dbufs); db != NULL; db = db_next) {
 
-#ifdef	DEBUG
+#ifdef	ZFS_DEBUG
 		DB_DNODE_ENTER(db);
 		ASSERT3P(DB_DNODE(db), ==, dn);
 		DB_DNODE_EXIT(db);
@@ -762,13 +763,22 @@ dnode_sync(dnode_t *dn, dmu_tx_t *tx)
 		dsfra.dsfra_dnode = dn;
 		dsfra.dsfra_tx = tx;
 		dsfra.dsfra_free_indirects = freeing_dnode;
+		mutex_enter(&dn->dn_mtx);
 		if (freeing_dnode) {
 			ASSERT(range_tree_contains(dn->dn_free_ranges[txgoff],
 			    0, dn->dn_maxblkid + 1));
 		}
-		mutex_enter(&dn->dn_mtx);
-		range_tree_vacate(dn->dn_free_ranges[txgoff],
+		/*
+		 * Because dnode_sync_free_range() must drop dn_mtx during its
+		 * processing, using it as a callback to range_tree_vacate() is
+		 * not safe.  No other operations (besides destroy) are allowed
+		 * once range_tree_vacate() has begun, and dropping dn_mtx
+		 * would leave a window open for another thread to observe that
+		 * invalid (and unsafe) state.
+		 */
+		range_tree_walk(dn->dn_free_ranges[txgoff],
 		    dnode_sync_free_range, &dsfra);
+		range_tree_vacate(dn->dn_free_ranges[txgoff], NULL, NULL);
 		range_tree_destroy(dn->dn_free_ranges[txgoff]);
 		dn->dn_free_ranges[txgoff] = NULL;
 		mutex_exit(&dn->dn_mtx);
@@ -841,6 +851,8 @@ dnode_sync(dnode_t *dn, dmu_tx_t *tx)
 	/*
 	 * Although we have dropped our reference to the dnode, it
 	 * can't be evicted until its written, and we haven't yet
-	 * initiated the IO for the dnode's dbuf.
+	 * initiated the IO for the dnode's dbuf.  Additionally, the caller
+	 * has already added a reference to the dnode because it's on the
+	 * os_synced_dnodes list.
 	 */
 }

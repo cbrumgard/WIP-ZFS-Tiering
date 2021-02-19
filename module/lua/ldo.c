@@ -29,6 +29,26 @@
 
 
 
+/* Return the number of bytes available on the stack. */
+#if defined (_KERNEL) && defined(__linux__)
+#include <asm/current.h>
+static intptr_t stack_remaining(void) {
+  intptr_t local;
+  local = (intptr_t)&local - (intptr_t)current->stack;
+  return local;
+}
+#elif defined (_KERNEL) && defined(__FreeBSD__)
+#include <sys/pcpu.h>
+static intptr_t stack_remaining(void) {
+  intptr_t local;
+  local = (intptr_t)&local - (intptr_t)curthread->td_kstack;
+  return local;
+}
+#else
+static intptr_t stack_remaining(void) {
+  return INTPTR_MAX;
+}
+#endif
 
 /*
 ** {======================================================
@@ -176,7 +196,6 @@ int luaD_rawrunprotected (lua_State *L, Pfunc f, void *ud) {
   struct lua_longjmp lj;
   lj.status = LUA_OK;
   lj.previous = L->errorJmp;  /* chain new error handler */
-  // cppcheck-suppress autoVariables
   L->errorJmp = &lj;
   LUAI_TRY(L, &lj,
     (*f)(L, ud);
@@ -445,8 +464,13 @@ void luaD_call (lua_State *L, StkId func, int nResults, int allowyield) {
     if (L->nCcalls == LUAI_MAXCCALLS)
       luaG_runerror(L, "C stack overflow");
     else if (L->nCcalls >= (LUAI_MAXCCALLS + (LUAI_MAXCCALLS>>3)))
-      luaD_throw(L, LUA_ERRERR);  /* error while handing stack error */
+      luaD_throw(L, LUA_ERRERR);  /* error while handling stack error */
   }
+  intptr_t remaining = stack_remaining();
+  if (L->runerror == 0 && remaining < LUAI_MINCSTACK)
+    luaG_runerror(L, "C stack overflow");
+  if (L->runerror != 0 && remaining < LUAI_MINCSTACK / 2)
+    luaD_throw(L, LUA_ERRERR);  /* error while handling stack error */
   if (!allowyield) L->nny++;
   if (!luaD_precall(L, func, nResults))  /* is a Lua function? */
     luaV_execute(L);  /* call it */

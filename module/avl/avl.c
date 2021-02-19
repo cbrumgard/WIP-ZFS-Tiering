@@ -96,6 +96,9 @@
  * which each have their own compilation environments and subsequent
  * requirements. Each of these environments must be considered when adding
  * dependencies from avl.c.
+ *
+ * Link to Illumos.org for more information on avl function:
+ * [1] https://illumos.org/man/9f/avl
  */
 
 #include <sys/types.h>
@@ -269,7 +272,7 @@ avl_find(avl_tree_t *tree, const void *value, avl_index_t *where)
 		diff = tree->avl_compar(value, AVL_NODE2DATA(node, off));
 		ASSERT(-1 <= diff && diff <= 1);
 		if (diff == 0) {
-#ifdef DEBUG
+#ifdef ZFS_DEBUG
 			if (where != NULL)
 				*where = 0;
 #endif
@@ -489,7 +492,6 @@ avl_insert(avl_tree_t *tree, void *new_data, avl_index_t where)
 	int which_child = AVL_INDEX2CHILD(where);
 	size_t off = tree->avl_offset;
 
-	ASSERT(tree);
 #ifdef _LP64
 	ASSERT(((uintptr_t)new_data & 0x7) == 0);
 #endif
@@ -578,7 +580,7 @@ avl_insert_here(
 {
 	avl_node_t *node;
 	int child = direction;	/* rely on AVL_BEFORE == 0, AVL_AFTER == 1 */
-#ifdef DEBUG
+#ifdef ZFS_DEBUG
 	int diff;
 #endif
 
@@ -593,7 +595,7 @@ avl_insert_here(
 	 */
 	node = AVL_DATA2NODE(here, tree->avl_offset);
 
-#ifdef DEBUG
+#ifdef ZFS_DEBUG
 	diff = tree->avl_compar(new_data, here);
 	ASSERT(-1 <= diff && diff <= 1);
 	ASSERT(diff != 0);
@@ -604,7 +606,7 @@ avl_insert_here(
 		node = node->avl_child[child];
 		child = 1 - child;
 		while (node->avl_child[child] != NULL) {
-#ifdef DEBUG
+#ifdef ZFS_DEBUG
 			diff = tree->avl_compar(new_data,
 			    AVL_NODE2DATA(node, tree->avl_offset));
 			ASSERT(-1 <= diff && diff <= 1);
@@ -613,7 +615,7 @@ avl_insert_here(
 #endif
 			node = node->avl_child[child];
 		}
-#ifdef DEBUG
+#ifdef ZFS_DEBUG
 		diff = tree->avl_compar(new_data,
 		    AVL_NODE2DATA(node, tree->avl_offset));
 		ASSERT(-1 <= diff && diff <= 1);
@@ -676,8 +678,6 @@ avl_remove(avl_tree_t *tree, void *data)
 	int right;
 	int which_child;
 	size_t off = tree->avl_offset;
-
-	ASSERT(tree);
 
 	delete = AVL_DATA2NODE(data, off);
 

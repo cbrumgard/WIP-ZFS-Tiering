@@ -56,14 +56,13 @@
 #include <sys/dmu.h>
 #include <sys/dmu_objset.h>
 #include <sys/dmu_tx.h>
-#include <sys/refcount.h>
+#include <sys/zfs_refcount.h>
 #include <sys/stat.h>
 #include <sys/zap.h>
 #include <sys/zfs_znode.h>
 #include <sys/sa.h>
 #include <sys/zfs_sa.h>
 #include <sys/zfs_stat.h>
-#include <sys/refcount.h>
 
 #include "zfs_prop.h"
 #include "zfs_comutil.h"
@@ -76,7 +75,7 @@ SYSCTL_INT(_debug_sizeof, OID_AUTO, znode, CTLFLAG_RD,
  * Define ZNODE_STATS to turn on statistic gathering. By default, it is only
  * turned on when DEBUG is also defined.
  */
-#ifdef	DEBUG
+#ifdef	ZFS_DEBUG
 #define	ZNODE_STATS
 #endif	/* DEBUG */
 
@@ -92,13 +91,12 @@ SYSCTL_INT(_debug_sizeof, OID_AUTO, znode, CTLFLAG_RD,
  * (such as VFS logic) that will not compile easily in userland.
  */
 #ifdef _KERNEL
-/*
- * Needed to close a small window in zfs_znode_move() that allows the zfsvfs to
- * be freed before it can be safely accessed.
- */
-krwlock_t zfsvfs_lock;
-
+#if !defined(KMEM_DEBUG) && __FreeBSD_version >= 1300102
+#define	_ZFS_USE_SMR
+static uma_zone_t znode_uma_zone;
+#else
 static kmem_cache_t *znode_cache = NULL;
+#endif
 
 extern struct vop_vector zfs_vnodeops;
 extern struct vop_vector zfs_fifoops;
@@ -151,7 +149,6 @@ zfs_znode_cache_constructor(void *buf, void *arg, int kmflags)
 
 	zp->z_acl_cached = NULL;
 	zp->z_vnode = NULL;
-	zp->z_moved = 0;
 	return (0);
 }
 
@@ -170,19 +167,78 @@ zfs_znode_cache_destructor(void *buf, void *arg)
 	ASSERT(zp->z_acl_cached == NULL);
 }
 
+
+#ifdef _ZFS_USE_SMR
+VFS_SMR_DECLARE;
+
+static int
+zfs_znode_cache_constructor_smr(void *mem, int size __unused, void *private,
+    int flags)
+{
+
+	return (zfs_znode_cache_constructor(mem, private, flags));
+}
+
+static void
+zfs_znode_cache_destructor_smr(void *mem, int size __unused, void *private)
+{
+
+	zfs_znode_cache_destructor(mem, private);
+}
+
 void
 zfs_znode_init(void)
 {
 	/*
 	 * Initialize zcache
 	 */
-	rw_init(&zfsvfs_lock, NULL, RW_DEFAULT, NULL);
+	ASSERT(znode_uma_zone == NULL);
+	znode_uma_zone = uma_zcreate("zfs_znode_cache",
+	    sizeof (znode_t), zfs_znode_cache_constructor_smr,
+	    zfs_znode_cache_destructor_smr, NULL, NULL, 0, 0);
+	VFS_SMR_ZONE_SET(znode_uma_zone);
+}
+
+static znode_t *
+zfs_znode_alloc_kmem(int flags)
+{
+
+	return (uma_zalloc_smr(znode_uma_zone, flags));
+}
+
+static void
+zfs_znode_free_kmem(znode_t *zp)
+{
+
+	uma_zfree_smr(znode_uma_zone, zp);
+}
+#else
+void
+zfs_znode_init(void)
+{
+	/*
+	 * Initialize zcache
+	 */
 	ASSERT(znode_cache == NULL);
 	znode_cache = kmem_cache_create("zfs_znode_cache",
 	    sizeof (znode_t), 0, zfs_znode_cache_constructor,
 	    zfs_znode_cache_destructor, NULL, NULL, NULL, 0);
-	// kmem_cache_set_move(znode_cache, zfs_znode_move);
 }
+
+static znode_t *
+zfs_znode_alloc_kmem(int flags)
+{
+
+	return (kmem_cache_alloc(znode_cache, flags));
+}
+
+static void
+zfs_znode_free_kmem(znode_t *zp)
+{
+
+	kmem_cache_free(znode_cache, zp);
+}
+#endif
 
 void
 zfs_znode_fini(void)
@@ -190,10 +246,17 @@ zfs_znode_fini(void)
 	/*
 	 * Cleanup zcache
 	 */
-	if (znode_cache)
+#ifdef _ZFS_USE_SMR
+	if (znode_uma_zone) {
+		uma_zdestroy(znode_uma_zone);
+		znode_uma_zone = NULL;
+	}
+#else
+	if (znode_cache) {
 		kmem_cache_destroy(znode_cache);
-	znode_cache = NULL;
-	rw_destroy(&zfsvfs_lock);
+		znode_cache = NULL;
+	}
+#endif
 }
 
 
@@ -212,9 +275,8 @@ zfs_create_share_dir(zfsvfs_t *zfsvfs, dmu_tx_t *tx)
 	vattr.va_uid = crgetuid(kcred);
 	vattr.va_gid = crgetgid(kcred);
 
-	sharezp = kmem_cache_alloc(znode_cache, KM_SLEEP);
+	sharezp = zfs_znode_alloc_kmem(KM_SLEEP);
 	ASSERT(!POINTER_IS_VALID(sharezp->z_zfsvfs));
-	sharezp->z_moved = 0;
 	sharezp->z_unlinked = 0;
 	sharezp->z_atime_dirty = 0;
 	sharezp->z_zfsvfs = zfsvfs;
@@ -231,7 +293,7 @@ zfs_create_share_dir(zfsvfs_t *zfsvfs, dmu_tx_t *tx)
 
 	zfs_acl_ids_free(&acl_ids);
 	sa_handle_destroy(sharezp->z_sa_hdl);
-	kmem_cache_free(znode_cache, sharezp);
+	zfs_znode_free_kmem(sharezp);
 
 	return (error);
 }
@@ -310,7 +372,7 @@ zfs_znode_dmu_fini(znode_t *zp)
 {
 	ASSERT(MUTEX_HELD(ZFS_OBJ_MUTEX(zp->z_zfsvfs, zp->z_id)) ||
 	    zp->z_unlinked ||
-	    RW_WRITE_HELD(&zp->z_zfsvfs->z_teardown_inactive_lock));
+	    ZFS_TEARDOWN_INACTIVE_WLOCKED(zp->z_zfsvfs));
 
 	sa_handle_destroy(zp->z_sa_hdl);
 	zp->z_sa_hdl = NULL;
@@ -350,7 +412,12 @@ zfs_znode_alloc(zfsvfs_t *zfsvfs, dmu_buf_t *db, int blksz,
 	int count = 0;
 	int error;
 
-	zp = kmem_cache_alloc(znode_cache, KM_SLEEP);
+	zp = zfs_znode_alloc_kmem(KM_SLEEP);
+
+#ifndef _ZFS_USE_SMR
+	KASSERT((zfsvfs->z_parent->z_vfs->mnt_kern_flag & MNTK_FPLOOKUP) == 0,
+	    ("%s: fast path lookup enabled without smr", __func__));
+#endif
 
 #if __FreeBSD_version >= 1300076
 	KASSERT(curthread->td_vp_reserved != NULL,
@@ -361,19 +428,14 @@ zfs_znode_alloc(zfsvfs_t *zfsvfs, dmu_buf_t *db, int blksz,
 #endif
 	error = getnewvnode("zfs", zfsvfs->z_parent->z_vfs, &zfs_vnodeops, &vp);
 	if (error != 0) {
-		kmem_cache_free(znode_cache, zp);
+		zfs_znode_free_kmem(zp);
 		return (NULL);
 	}
 	zp->z_vnode = vp;
 	vp->v_data = zp;
 
 	ASSERT(!POINTER_IS_VALID(zp->z_zfsvfs));
-	zp->z_moved = 0;
 
-	/*
-	 * Defer setting z_zfsvfs until the znode is ready to be a candidate for
-	 * the zfs_znode_move() callback.
-	 */
 	zp->z_sa_hdl = NULL;
 	zp->z_unlinked = 0;
 	zp->z_atime_dirty = 0;
@@ -417,7 +479,7 @@ zfs_znode_alloc(zfsvfs_t *zfsvfs, dmu_buf_t *db, int blksz,
 			sa_handle_destroy(zp->z_sa_hdl);
 		zfs_vnode_forget(vp);
 		zp->z_vnode = NULL;
-		kmem_cache_free(znode_cache, zp);
+		zfs_znode_free_kmem(zp);
 		return (NULL);
 	}
 
@@ -450,11 +512,6 @@ zfs_znode_alloc(zfsvfs_t *zfsvfs, dmu_buf_t *db, int blksz,
 	mutex_enter(&zfsvfs->z_znodes_lock);
 	list_insert_tail(&zfsvfs->z_all_znodes, zp);
 	zfsvfs->z_nr_znodes++;
-	membar_producer();
-	/*
-	 * Everything else must be valid before assigning z_zfsvfs makes the
-	 * znode eligible for zfs_znode_move().
-	 */
 	zp->z_zfsvfs = zfsvfs;
 	mutex_exit(&zfsvfs->z_znodes_lock);
 
@@ -763,6 +820,8 @@ zfs_xvattr_set(znode_t *zp, xvattr_t *xvap, dmu_tx_t *tx)
 
 	xoap = xva_getxoptattr(xvap);
 	ASSERT(xoap);
+
+	ASSERT_VOP_IN_SEQC(ZTOV(zp));
 
 	if (XVA_ISSET_REQ(xvap, XAT_CREATETIME)) {
 		uint64_t times[2];
@@ -1192,8 +1251,7 @@ zfs_znode_free(znode_t *zp)
 		zp->z_acl_cached = NULL;
 	}
 
-	kmem_cache_free(znode_cache, zp);
-
+	zfs_znode_free_kmem(zp);
 }
 
 void
@@ -1629,9 +1687,8 @@ zfs_create_fs(objset_t *os, cred_t *cr, nvlist_t *zplprops, dmu_tx_t *tx)
 
 	zfsvfs = kmem_zalloc(sizeof (zfsvfs_t), KM_SLEEP);
 
-	rootzp = kmem_cache_alloc(znode_cache, KM_SLEEP);
+	rootzp = zfs_znode_alloc_kmem(KM_SLEEP);
 	ASSERT(!POINTER_IS_VALID(rootzp->z_zfsvfs));
-	rootzp->z_moved = 0;
 	rootzp->z_unlinked = 0;
 	rootzp->z_atime_dirty = 0;
 	rootzp->z_is_sa = USE_SA(version, os);
@@ -1673,7 +1730,7 @@ zfs_create_fs(objset_t *os, cred_t *cr, nvlist_t *zplprops, dmu_tx_t *tx)
 	POINTER_INVALIDATE(&rootzp->z_zfsvfs);
 
 	sa_handle_destroy(rootzp->z_sa_hdl);
-	kmem_cache_free(znode_cache, rootzp);
+	zfs_znode_free_kmem(rootzp);
 
 	/*
 	 * Create shares directory
@@ -1848,8 +1905,10 @@ zfs_obj_to_path_impl(objset_t *osp, uint64_t obj, sa_handle_t *hdl,
 		size_t complen;
 		int is_xattrdir;
 
-		if (prevdb)
+		if (prevdb) {
+			ASSERT(prevhdl != NULL);
 			zfs_release_sa_handle(prevhdl, prevdb, FTAG);
+		}
 
 		if ((error = zfs_obj_to_pobj(osp, sa_hdl, sa_table, &pobj,
 		    &is_xattrdir)) != 0)
@@ -1953,6 +2012,20 @@ zfs_obj_to_stats(objset_t *osp, uint64_t obj, zfs_stat_t *sb,
 	zfs_release_sa_handle(hdl, db, FTAG);
 	return (error);
 }
+
+
+void
+zfs_znode_update_vfs(znode_t *zp)
+{
+	vm_object_t object;
+
+	if ((object = ZTOV(zp)->v_object) == NULL ||
+	    zp->z_size == object->un_pager.vnp.vnp_size)
+		return;
+
+	vnode_pager_setsize(ZTOV(zp), zp->z_size);
+}
+
 
 #ifdef _KERNEL
 int

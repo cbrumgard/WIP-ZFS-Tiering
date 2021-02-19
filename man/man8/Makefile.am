@@ -1,3 +1,5 @@
+include $(top_srcdir)/config/Substfiles.am
+
 dist_man_MANS = \
 	fsck.zfs.8 \
 	mount.zfs.8 \
@@ -80,25 +82,21 @@ dist_man_MANS = \
 	zpool-upgrade.8 \
 	zpool-wait.8 \
 	zstream.8 \
-	zstreamdump.8
+	zstreamdump.8 \
+	zpool_influxdb.8
 
 nodist_man_MANS = \
 	zed.8 \
 	zfs-mount-generator.8
 
-EXTRA_DIST = \
-	zed.8.in \
-	zfs-mount-generator.8.in
+SUBSTFILES += $(nodist_man_MANS)
 
-$(nodist_man_MANS): %: %.in
-	-$(SED) -e 's,@zfsexecdir\@,$(zfsexecdir),g' \
-		-e 's,@systemdgeneratordir\@,$(systemdgeneratordir),g' \
-		-e 's,@runstatedir\@,$(runstatedir),g' \
-		-e 's,@sysconfdir\@,$(sysconfdir),g' \
-		$< >'$@'
-
-install-data-local:
-	$(INSTALL) -d -m 0755 "$(DESTDIR)$(mandir)/man8"
-
-CLEANFILES = \
-	$(nodist_man_MANS)
+if BUILD_LINUX
+# The man pager in most Linux distros defaults to BSD instead of Linux
+# when .Os is blank, but leaving it blank makes things a lot easier on
+# FreeBSD when OpenZFS is vendored in the base system.
+install-data-hook:
+	cd $(DESTDIR)$(mandir)/man8; \
+	$(SED) ${ac_inplace} -e 's/^\.Os$$/.Os Linux/' \
+	    $(dist_man_MANS) $(nodist_man_MANS)
+endif

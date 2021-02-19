@@ -6,7 +6,6 @@
  *  UCRL-CODE-235197
  *
  *  This file is part of the SPL, Solaris Porting Layer.
- *  For details, see <http://zfsonlinux.org/>.
  *
  *  The SPL is free software; you can redistribute it and/or modify it
  *  under the terms of the GNU General Public License as published by the
@@ -26,6 +25,7 @@
 #define	_SPL_LIST_H
 
 #include <sys/types.h>
+#include <sys/debug.h>
 #include <linux/list.h>
 
 /*
@@ -184,7 +184,8 @@ list_prev(list_t *list, void *object)
 static inline int
 list_link_active(list_node_t *node)
 {
-	return (node->next != LIST_POISON1) && (node->prev != LIST_POISON2);
+	EQUIV(node->next == LIST_POISON1, node->prev == LIST_POISON2);
+	return (node->next != LIST_POISON1);
 }
 
 static inline void

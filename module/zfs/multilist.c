@@ -33,7 +33,7 @@ int zfs_multilist_num_sublists = 0;
  * Given the object contained on the list, return a pointer to the
  * object's multilist_node_t structure it contains.
  */
-#ifdef DEBUG
+#ifdef ZFS_DEBUG
 static multilist_node_t *
 multilist_d2l(multilist_t *ml, void *obj)
 {
@@ -96,9 +96,12 @@ multilist_create_impl(size_t size, size_t offset,
 }
 
 /*
- * Allocate a new multilist, using the default number of sublists
- * (the number of CPUs, or at least 4, or the tunable
- * zfs_multilist_num_sublists).
+ * Allocate a new multilist, using the default number of sublists (the number
+ * of CPUs, or at least 4, or the tunable zfs_multilist_num_sublists). Note
+ * that the multilists do not expand if more CPUs are hot-added. In that case,
+ * we will have less fanout than boot_ncpus, but we don't want to always
+ * reserve the RAM necessary to create the extra slots for additional CPUs up
+ * front, and dynamically adding them is a complex task.
  */
 multilist_t *
 multilist_create(size_t size, size_t offset,

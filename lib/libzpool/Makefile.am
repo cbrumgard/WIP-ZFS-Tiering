@@ -7,11 +7,23 @@ VPATH = \
 	$(top_srcdir)/module/os/linux/zfs \
 	$(top_srcdir)/lib/libzpool
 
+if BUILD_FREEBSD
+DEFAULT_INCLUDES += -I$(top_srcdir)/include/os/freebsd/zfs
+endif
+if BUILD_LINUX
+DEFAULT_INCLUDES += -I$(top_srcdir)/include/os/linux/zfs
+endif
+
+# Unconditionally enable debugging for libzpool
+AM_CPPFLAGS += -DDEBUG -UNDEBUG -DZFS_DEBUG
+
 # Suppress unused but set variable warnings often due to ASSERTs
 AM_CFLAGS += $(NO_UNUSED_BUT_SET_VARIABLE)
 
 # Includes kernel code generate warnings for large stack frames
 AM_CFLAGS += $(FRAME_LARGER_THAN)
+
+AM_CFLAGS += $(ZLIB_CFLAGS)
 
 AM_CFLAGS += -DLIB_ZPOOL_BUILD
 
@@ -35,7 +47,6 @@ KERNEL_C = \
 	zfs_fletcher_superscalar4.c \
 	zfs_namecheck.c \
 	zfs_prop.c \
-	zfs_uio.c \
 	zpool_prop.c \
 	zprop_common.c \
 	abd.c \
@@ -112,6 +123,8 @@ KERNEL_C = \
 	unique.c \
 	vdev.c \
 	vdev_cache.c \
+	vdev_draid.c \
+	vdev_draid_rand.c \
 	vdev_file.c \
 	vdev_indirect_births.c \
 	vdev_indirect.c \
@@ -132,6 +145,7 @@ KERNEL_C = \
 	vdev_raidz_math_sse2.c \
 	vdev_raidz_math_ssse3.c \
 	vdev_raidz_math_powerpc_altivec.c \
+	vdev_rebuild.c \
 	vdev_removal.c \
 	vdev_root.c \
 	vdev_tiering.c \
@@ -190,28 +204,37 @@ LUA_C = \
 	lvm.c \
 	lzio.c
 
+dist_libzpool_la_SOURCES = \
+	$(USER_C)
+
 nodist_libzpool_la_SOURCES = \
-	$(USER_C) \
 	$(KERNEL_C) \
 	$(LUA_C)
 
 libzpool_la_LIBADD = \
-	$(top_builddir)/lib/libicp/libicp.la \
-	$(top_builddir)/lib/libnvpair/libnvpair.la \
-	$(top_builddir)/lib/libunicode/libunicode.la \
-	$(top_builddir)/lib/libzutil/libzutil.la
+	$(abs_top_builddir)/lib/libicp/libicp.la \
+	$(abs_top_builddir)/lib/libunicode/libunicode.la \
+	$(abs_top_builddir)/lib/libzfs_core/libzfs_core.la \
+	$(abs_top_builddir)/lib/libnvpair/libnvpair.la \
+	$(abs_top_builddir)/lib/libzstd/libzstd.la
 
-if BUILD_FREEBSD
-libzpool_la_LIBADD += $(ZLIB) -ldl -lgeom
-libzpool_la_LDFLAGS = -pthread -version-info 4:0:0
-else
-libzpool_la_LIBADD += $(ZLIB) -ldl
-libzpool_la_LDFLAGS = -pthread -version-info 2:0:0
+libzpool_la_LIBADD += $(LIBCLOCK_GETTIME) $(ZLIB_LIBS) -ldl -lm
+
+libzpool_la_LDFLAGS = -pthread
+
+if !ASAN_ENABLED
+libzpool_la_LDFLAGS += -Wl,-z,defs
 endif
 
-EXTRA_DIST = $(USER_C)
+if BUILD_FREEBSD
+libzpool_la_LIBADD += -lgeom
+endif
+
+libzpool_la_LDFLAGS += -version-info 4:0:0
 
 if TARGET_CPU_POWERPC
 vdev_raidz_math_powerpc_altivec.$(OBJEXT): CFLAGS += -maltivec
 vdev_raidz_math_powerpc_altivec.l$(OBJEXT): CFLAGS += -maltivec
 endif
+
+include $(top_srcdir)/config/CppCheck.am

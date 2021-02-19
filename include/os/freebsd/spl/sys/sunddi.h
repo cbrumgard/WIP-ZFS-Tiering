@@ -6,7 +6,6 @@
  *  UCRL-CODE-235197
  *
  *  This file is part of the SPL, Solaris Porting Layer.
- *  For details, see <http://zfsonlinux.org/>.
  *
  *  The SPL is free software; you can redistribute it and/or modify it
  *  under the terms of the GNU General Public License as published by the
@@ -29,7 +28,9 @@
 #include <sys/uio.h>
 #include <sys/mutex.h>
 #include <sys/u8_textprep.h>
+#ifdef BUILDING_ZFS
 #include <sys/vnode.h>
+#endif
 
 typedef int ddi_devid_t;
 

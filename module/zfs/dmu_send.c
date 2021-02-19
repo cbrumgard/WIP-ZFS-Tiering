@@ -26,6 +26,8 @@
  * Copyright 2014 HybridCluster. All rights reserved.
  * Copyright 2016 RackTop Systems.
  * Copyright (c) 2016 Actifio, Inc. All rights reserved.
+ * Copyright (c) 2019, Klara Inc.
+ * Copyright (c) 2019, Allan Jude
  */
 
 #include <sys/dmu.h>
@@ -641,7 +643,7 @@ dump_freeobjects(dmu_send_cookie_t *dscp, uint64_t firstobj, uint64_t numobjs)
 	 * receiving side.
 	 */
 	if (maxobj > 0) {
-		if (maxobj < firstobj)
+		if (maxobj <= firstobj)
 			return (0);
 
 		if (maxobj < firstobj + numobjs)
@@ -661,8 +663,6 @@ dump_freeobjects(dmu_send_cookie_t *dscp, uint64_t firstobj, uint64_t numobjs)
 			return (SET_ERROR(EINTR));
 		dscp->dsc_pending_op = PENDING_NONE;
 	}
-	if (numobjs == 0)
-		numobjs = UINT64_MAX - firstobj;
 
 	if (dscp->dsc_pending_op == PENDING_FREEOBJECTS) {
 		/*
@@ -860,6 +860,14 @@ send_do_embed(const blkptr_t *bp, uint64_t featureflags)
 	 */
 	if ((BP_GET_COMPRESS(bp) >= ZIO_COMPRESS_LEGACY_FUNCTIONS &&
 	    !(featureflags & DMU_BACKUP_FEATURE_LZ4)))
+		return (B_FALSE);
+
+	/*
+	 * If we have not set the ZSTD feature flag, we can't send ZSTD
+	 * compressed embedded blocks, as the receiver may not support them.
+	 */
+	if ((BP_GET_COMPRESS(bp) == ZIO_COMPRESS_ZSTD &&
+	    !(featureflags & DMU_BACKUP_FEATURE_ZSTD)))
 		return (B_FALSE);
 
 	/*
@@ -1954,6 +1962,7 @@ setup_featureflags(struct dmu_send_params *dspp, objset_t *os,
 	/* raw send implies compressok */
 	if (dspp->compressok || dspp->rawok)
 		*featureflags |= DMU_BACKUP_FEATURE_COMPRESSED;
+
 	if (dspp->rawok && os->os_encrypted)
 		*featureflags |= DMU_BACKUP_FEATURE_RAW;
 
@@ -1962,6 +1971,17 @@ setup_featureflags(struct dmu_send_params *dspp, objset_t *os,
 	    DMU_BACKUP_FEATURE_RAW)) != 0 &&
 	    spa_feature_is_active(dp->dp_spa, SPA_FEATURE_LZ4_COMPRESS)) {
 		*featureflags |= DMU_BACKUP_FEATURE_LZ4;
+	}
+
+	/*
+	 * We specifically do not include DMU_BACKUP_FEATURE_EMBED_DATA here to
+	 * allow sending ZSTD compressed datasets to a receiver that does not
+	 * support ZSTD
+	 */
+	if ((*featureflags &
+	    (DMU_BACKUP_FEATURE_COMPRESSED | DMU_BACKUP_FEATURE_RAW)) != 0 &&
+	    dsl_dataset_feature_is_active(to_ds, SPA_FEATURE_ZSTD_COMPRESS)) {
+		*featureflags |= DMU_BACKUP_FEATURE_ZSTD;
 	}
 
 	if (dspp->resumeobj != 0 || dspp->resumeoff != 0) {
@@ -2606,7 +2626,7 @@ dmu_send_obj(const char *pool, uint64_t tosnap, uint64_t fromsnap,
 {
 	int err;
 	dsl_dataset_t *fromds;
-	ds_hold_flags_t dsflags = (rawok) ? 0 : DS_HOLD_FLAG_DECRYPT;
+	ds_hold_flags_t dsflags;
 	struct dmu_send_params dspp = {0};
 	dspp.embedok = embedok;
 	dspp.large_block_ok = large_block_ok;
@@ -2618,6 +2638,7 @@ dmu_send_obj(const char *pool, uint64_t tosnap, uint64_t fromsnap,
 	dspp.rawok = rawok;
 	dspp.savedok = savedok;
 
+	dsflags = (rawok) ? DS_HOLD_FLAG_NONE : DS_HOLD_FLAG_DECRYPT;
 	err = dsl_pool_hold(pool, FTAG, &dspp.dp);
 	if (err != 0)
 		return (err);
@@ -2664,12 +2685,15 @@ dmu_send_obj(const char *pool, uint64_t tosnap, uint64_t fromsnap,
 			bcopy(fromredact, dspp.fromredactsnaps, size);
 		}
 
-		if (!dsl_dataset_is_before(dspp.to_ds, fromds, 0)) {
+		boolean_t is_before =
+		    dsl_dataset_is_before(dspp.to_ds, fromds, 0);
+		dspp.is_clone = (dspp.to_ds->ds_dir !=
+		    fromds->ds_dir);
+		dsl_dataset_rele(fromds, FTAG);
+		if (!is_before) {
+			dsl_pool_rele(dspp.dp, FTAG);
 			err = SET_ERROR(EXDEV);
 		} else {
-			dspp.is_clone = (dspp.to_ds->ds_dir !=
-			    fromds->ds_dir);
-			dsl_dataset_rele(fromds, FTAG);
 			err = dmu_send_impl(&dspp);
 		}
 	} else {
@@ -2688,12 +2712,13 @@ dmu_send(const char *tosnap, const char *fromsnap, boolean_t embedok,
     dmu_send_outparams_t *dsop)
 {
 	int err = 0;
-	ds_hold_flags_t dsflags = (rawok) ? 0 : DS_HOLD_FLAG_DECRYPT;
+	ds_hold_flags_t dsflags;
 	boolean_t owned = B_FALSE;
 	dsl_dataset_t *fromds = NULL;
 	zfs_bookmark_phys_t book = {0};
 	struct dmu_send_params dspp = {0};
 
+	dsflags = (rawok) ? DS_HOLD_FLAG_NONE : DS_HOLD_FLAG_DECRYPT;
 	dspp.tosnap = tosnap;
 	dspp.embedok = embedok;
 	dspp.large_block_ok = large_block_ok;

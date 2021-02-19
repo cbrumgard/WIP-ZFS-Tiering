@@ -27,6 +27,7 @@
 #include <sys/cdefs.h>
 __FBSDID("$FreeBSD$");
 
+#include <sys/types.h>
 #include <sys/param.h>
 #include <sys/kernel.h>
 #include <sys/systm.h>
@@ -239,12 +240,6 @@ zone_get_hostid(void *ptr)
 	KASSERT(ptr == NULL, ("only NULL pointer supported in %s", __func__));
 
 	return ((uint32_t)curthread->td_ucred->cr_prison->pr_hostid);
-}
-
-boolean_t
-in_globalzone(struct proc *p)
-{
-	return (!jailed(FIRST_THREAD_IN_PROC((p))->td_ucred));
 }
 
 static void

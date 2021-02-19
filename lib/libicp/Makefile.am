@@ -72,4 +72,4 @@ nodist_libicp_la_SOURCES = \
 	$(KERNEL_C) \
 	$(KERNEL_ASM)
 
-libicp_la_LIBADD = -lrt
+include $(top_srcdir)/config/CppCheck.am

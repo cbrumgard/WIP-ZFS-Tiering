@@ -22,9 +22,13 @@
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright 2020 Joyent, Inc. All rights reserved.
- * Copyright (c) 2011, 2018 by Delphix. All rights reserved.
+ * Copyright (c) 2011, 2020 by Delphix. All rights reserved.
  * Copyright 2016 Igor Kozhukhov <ikozhukhov@gmail.com>
  * Copyright (c) 2017 Datto Inc.
+ * Copyright (c) 2020 The FreeBSD Foundation
+ *
+ * Portions of this software were developed by Allan Jude
+ * under sponsorship from the FreeBSD Foundation.
  */
 
 /*
@@ -144,15 +148,15 @@ libzfs_error_description(libzfs_handle_t *hdl)
 	case EZFS_MOUNTFAILED:
 		return (dgettext(TEXT_DOMAIN, "mount failed"));
 	case EZFS_UMOUNTFAILED:
-		return (dgettext(TEXT_DOMAIN, "umount failed"));
+		return (dgettext(TEXT_DOMAIN, "unmount failed"));
 	case EZFS_UNSHARENFSFAILED:
-		return (dgettext(TEXT_DOMAIN, "unshare(1M) failed"));
+		return (dgettext(TEXT_DOMAIN, "NFS share removal failed"));
 	case EZFS_SHARENFSFAILED:
-		return (dgettext(TEXT_DOMAIN, "share(1M) failed"));
+		return (dgettext(TEXT_DOMAIN, "NFS share creation failed"));
 	case EZFS_UNSHARESMBFAILED:
-		return (dgettext(TEXT_DOMAIN, "smb remove share failed"));
+		return (dgettext(TEXT_DOMAIN, "SMB share removal failed"));
 	case EZFS_SHARESMBFAILED:
-		return (dgettext(TEXT_DOMAIN, "smb add share failed"));
+		return (dgettext(TEXT_DOMAIN, "SMB share creation failed"));
 	case EZFS_PERM:
 		return (dgettext(TEXT_DOMAIN, "permission denied"));
 	case EZFS_NOSPC:
@@ -286,6 +290,9 @@ libzfs_error_description(libzfs_handle_t *hdl)
 		    "resilver_defer feature"));
 	case EZFS_EXPORT_IN_PROGRESS:
 		return (dgettext(TEXT_DOMAIN, "pool export in progress"));
+	case EZFS_REBUILDING:
+		return (dgettext(TEXT_DOMAIN, "currently sequentially "
+		    "resilvering"));
 	case EZFS_UNKNOWN:
 		return (dgettext(TEXT_DOMAIN, "unknown error"));
 	default:
@@ -324,7 +331,8 @@ zfs_verror(libzfs_handle_t *hdl, int error, const char *fmt, va_list ap)
 	if (hdl->libzfs_printerr) {
 		if (error == EZFS_UNKNOWN) {
 			(void) fprintf(stderr, dgettext(TEXT_DOMAIN, "internal "
-			    "error: %s\n"), libzfs_error_description(hdl));
+			    "error: %s: %s\n"), hdl->libzfs_action,
+			    libzfs_error_description(hdl));
 			abort();
 		}
 
@@ -471,6 +479,9 @@ zfs_standard_error_fmt(libzfs_handle_t *hdl, int error, const char *fmt, ...)
 	case ZFS_ERR_WRONG_PARENT:
 		zfs_verror(hdl, EZFS_WRONG_PARENT, fmt, ap);
 		break;
+	case ZFS_ERR_BADPROP:
+		zfs_verror(hdl, EZFS_BADPROP, fmt, ap);
+		break;
 	default:
 		zfs_error_aux(hdl, strerror(error));
 		zfs_verror(hdl, EZFS_UNKNOWN, fmt, ap);
@@ -561,6 +572,10 @@ zfs_setprop_error(libzfs_handle_t *hdl, zfs_prop_t prop, int err,
 		} else {
 			(void) zfs_standard_error(hdl, err, errbuf);
 		}
+		break;
+
+	case ZFS_ERR_BADPROP:
+		(void) zfs_error(hdl, EZFS_BADPROP, errbuf);
 		break;
 
 	case EACCES:
@@ -692,6 +707,15 @@ zpool_standard_error_fmt(libzfs_handle_t *hdl, int error, const char *fmt, ...)
 		break;
 	case ZFS_ERR_EXPORT_IN_PROGRESS:
 		zfs_verror(hdl, EZFS_EXPORT_IN_PROGRESS, fmt, ap);
+		break;
+	case ZFS_ERR_RESILVER_IN_PROGRESS:
+		zfs_verror(hdl, EZFS_RESILVERING, fmt, ap);
+		break;
+	case ZFS_ERR_REBUILD_IN_PROGRESS:
+		zfs_verror(hdl, EZFS_REBUILDING, fmt, ap);
+		break;
+	case ZFS_ERR_BADPROP:
+		zfs_verror(hdl, EZFS_BADPROP, fmt, ap);
 		break;
 	case ZFS_ERR_IOC_CMD_UNAVAIL:
 		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN, "the loaded zfs "
@@ -984,9 +1008,9 @@ libzfs_init(void)
 {
 	libzfs_handle_t *hdl;
 	int error;
+	char *env;
 
-	error = libzfs_load_module();
-	if (error) {
+	if ((error = libzfs_load_module()) != 0) {
 		errno = error;
 		return (NULL);
 	}
@@ -1015,13 +1039,9 @@ libzfs_init(void)
 		return (NULL);
 	}
 
-	hdl->libzfs_sharetab = fopen(ZFS_SHARETAB, "r");
-
 	if (libzfs_core_init() != 0) {
 		(void) close(hdl->libzfs_fd);
 		(void) fclose(hdl->libzfs_mnttab);
-		if (hdl->libzfs_sharetab)
-			(void) fclose(hdl->libzfs_sharetab);
 		free(hdl);
 		return (NULL);
 	}
@@ -1034,6 +1054,18 @@ libzfs_init(void)
 
 	if (getenv("ZFS_PROP_DEBUG") != NULL) {
 		hdl->libzfs_prop_debug = B_TRUE;
+	}
+	if ((env = getenv("ZFS_SENDRECV_MAX_NVLIST")) != NULL) {
+		if ((error = zfs_nicestrtonum(hdl, env,
+		    &hdl->libzfs_max_nvlist))) {
+			errno = error;
+			(void) close(hdl->libzfs_fd);
+			(void) fclose(hdl->libzfs_mnttab);
+			free(hdl);
+			return (NULL);
+		}
+	} else {
+		hdl->libzfs_max_nvlist = (SPA_MAXBLOCKSIZE * 4);
 	}
 
 	/*
@@ -1065,9 +1097,6 @@ libzfs_fini(libzfs_handle_t *hdl)
 #else
 		(void) fclose(hdl->libzfs_mnttab);
 #endif
-	if (hdl->libzfs_sharetab)
-		(void) fclose(hdl->libzfs_sharetab);
-	zfs_uninit_libshare(hdl);
 	zpool_free_handles(hdl);
 	namespace_clear(hdl);
 	libzfs_mnttab_fini(hdl);
@@ -1102,7 +1131,7 @@ zfs_get_pool_handle(const zfs_handle_t *zhp)
  * fs/vol/snap/bkmark name.
  */
 zfs_handle_t *
-zfs_path_to_zhandle(libzfs_handle_t *hdl, char *path, zfs_type_t argtype)
+zfs_path_to_zhandle(libzfs_handle_t *hdl, const char *path, zfs_type_t argtype)
 {
 	struct stat64 statbuf;
 	struct extmnttab entry;
@@ -1967,15 +1996,16 @@ zfs_version_print(void)
 	char zver_userland[128];
 	char zver_kernel[128];
 
+	zfs_version_userland(zver_userland, sizeof (zver_userland));
+
+	(void) printf("%s\n", zver_userland);
+
 	if (zfs_version_kernel(zver_kernel, sizeof (zver_kernel)) == -1) {
 		fprintf(stderr, "zfs_version_kernel() failed: %s\n",
 		    strerror(errno));
 		return (-1);
 	}
 
-	zfs_version_userland(zver_userland, sizeof (zver_userland));
-
-	(void) printf("%s\n", zver_userland);
 	(void) printf("zfs-kmod-%s\n", zver_kernel);
 
 	return (0);

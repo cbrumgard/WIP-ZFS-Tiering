@@ -324,7 +324,6 @@ static void kname (Proto *p, int pc, int c, const char **name) {
   if (ISK(c)) {  /* is 'c' a constant? */
     TValue *kvalue = &p->k[INDEXK(c)];
     if (ttisstring(kvalue)) {  /* literal constant? */
-      // cppcheck-suppress autoVariables
       *name = svalue(kvalue);  /* it is its own name */
       return;
     }
@@ -598,10 +597,12 @@ l_noret luaG_errormsg (lua_State *L) {
 
 
 l_noret luaG_runerror (lua_State *L, const char *fmt, ...) {
+  L->runerror++;
   va_list argp;
   va_start(argp, fmt);
   addinfo(L, luaO_pushvfstring(L, fmt, argp));
   va_end(argp);
   luaG_errormsg(L);
+  L->runerror--;
 }
 /* END CSTYLED */

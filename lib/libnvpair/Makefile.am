@@ -10,6 +10,8 @@ AM_CFLAGS += $(FRAME_LARGER_THAN) $(LIBTIRPC_CFLAGS)
 
 lib_LTLIBRARIES = libnvpair.la
 
+include $(top_srcdir)/config/Abigail.am
+
 USER_C = \
 	libnvpair.c \
 	libnvpair_json.c \
@@ -20,18 +22,26 @@ KERNEL_C = \
 	nvpair.c \
 	fnvpair.c
 
+dist_libnvpair_la_SOURCES = \
+	$(USER_C)
+
 nodist_libnvpair_la_SOURCES = \
-	$(USER_C) \
 	$(KERNEL_C)
 
-if BUILD_FREEBSD
-libnvpair_la_LIBADD = $(LIBTIRPC_LIBS) -L/usr/local/lib -lintl
-libnvpair_la_LDFLAGS = -version-info 3:0:0
-else
-libnvpair_la_LIBADD = $(LIBTIRPC_LIBS)
-libnvpair_la_LDFLAGS = -version-info 1:1:0
+libnvpair_la_LIBADD = \
+	$(abs_top_builddir)/lib/libspl/libspl_assert.la
+
+libnvpair_la_LIBADD += $(LIBTIRPC_LIBS) $(LTLIBINTL)
+
+libnvpair_la_LDFLAGS =
+
+if !ASAN_ENABLED
+libnvpair_la_LDFLAGS += -Wl,-z,defs
 endif
 
+libnvpair_la_LDFLAGS += -version-info 3:0:0
 
+include $(top_srcdir)/config/CppCheck.am
 
-EXTRA_DIST = $(USER_C)
+# Library ABI
+EXTRA_DIST = libnvpair.abi libnvpair.suppr

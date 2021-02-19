@@ -34,9 +34,11 @@
 #include <sys/vnode.h>
 struct mount;
 struct vattr;
+struct znode;
 
 int	secpolicy_nfs(cred_t *cr);
 int	secpolicy_zfs(cred_t *crd);
+int	secpolicy_zfs_proc(cred_t *cr, proc_t *proc);
 int	secpolicy_sys_config(cred_t *cr, int checkonly);
 int	secpolicy_zinject(cred_t *cr);
 int	secpolicy_fs_unmount(cred_t *cr, struct mount *vfsp);
@@ -56,7 +58,7 @@ int	secpolicy_vnode_setattr(cred_t *cr, vnode_t *vp, struct vattr *vap,
 	    int unlocked_access(void *, int, cred_t *), void *node);
 int	secpolicy_vnode_create_gid(cred_t *cr);
 int	secpolicy_vnode_setids_setgids(vnode_t *vp, cred_t *cr, gid_t gid);
-int	secpolicy_vnode_setid_retain(vnode_t *vp, cred_t *cr,
+int	secpolicy_vnode_setid_retain(struct znode *zp, cred_t *cr,
 	    boolean_t issuidroot);
 void	secpolicy_setid_clear(struct vattr *vap, vnode_t *vp, cred_t *cr);
 int	secpolicy_setid_setsticky_clear(vnode_t *vp, struct vattr *vap,

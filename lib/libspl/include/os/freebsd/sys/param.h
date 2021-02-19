@@ -45,8 +45,6 @@
  */
 #define	MAXNAMELEN	256
 
-#define	UID_NOBODY	60001		/* user ID no body */
-#define	GID_NOBODY	UID_NOBODY
 #define	UID_NOACCESS	60002		/* user ID no access */
 
 #define	MAXUID		UINT32_MAX	/* max user id */
@@ -60,11 +58,5 @@ extern size_t spl_pagesize(void);
 #define	PAGESIZE	(spl_pagesize())
 
 extern int execvpe(const char *name, char * const argv[], char * const envp[]);
-
-struct zfs_handle;
-/*
- * Attach/detach the given filesystem to/from the given jail.
- */
-extern int zfs_jail(struct zfs_handle *zhp, int jailid, int attach);
 
 #endif
