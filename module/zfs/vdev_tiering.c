@@ -1034,7 +1034,7 @@ vdev_tiering_map_free(tiering_map_t *tiering_map) {
 
 static int
 vdev_tiering_open(vdev_t *vd, u_int64_t *asize, u_int64_t *max_asize,
-                  u_int64_t *ashift)
+                  uint64_t *logical_ashift, uint64_t *physical_ashift)
 {
     tiering_map_t *tiering_map = NULL;
 
@@ -1060,15 +1060,21 @@ vdev_tiering_open(vdev_t *vd, u_int64_t *asize, u_int64_t *max_asize,
     /* Create the name for the pool of the new tier */
     snprintf(name, sizeof(name), "%s-tier0", spa_name(vd->vdev_spa));
 
-    ASSERT(MUTEX_HELD(&spa_namespace_lock));
-
     zfs_dbgmsg("Inside of %s@%d looking for spa %s", __FUNCTION__, __LINE__, name);
+
+
+
+
+    ASSERT(MUTEX_HELD(&spa_namespace_lock));
 
     /* Find the performance spa by name */
     performance_spa = spa_lookup(name);
 
+    //mutex_exit(&spa_namespace_lock);
+
     /* Spa not found, so report and error */
     if (performance_spa == NULL) {
+        zfs_dbgmsg("Inside of %s@%d performance_spa = %p", __FUNCTION__, __LINE__, performance_spa);
         return (SET_ERROR(EINVAL));
     }
 
@@ -1121,7 +1127,9 @@ vdev_tiering_open(vdev_t *vd, u_int64_t *asize, u_int64_t *max_asize,
          * for the child vdevs and  */
         *asize = MIN(*asize - 1, child_vdev->vdev_asize - 1) + 1;
         *max_asize = MIN(*max_asize - 1, child_vdev->vdev_max_asize - 1) + 1;
-        *ashift = MAX(*ashift, child_vdev->vdev_ashift);
+        *logical_ashift = MAX(*logical_ashift, child_vdev->vdev_ashift);
+        *physical_ashift = MAX(*physical_ashift,
+                               child_vdev->vdev_physical_ashift);
     }
 
     /* Create an initialize tiering map */
@@ -1597,14 +1605,18 @@ vdev_tiering_io_done(zio_t *zio) {
 }
 
 
-/* Provides the tiering operation functions. Only op_type and op_leaf are set to
- * anything meaningful at the moment */
+/* Provides the tiering operation functions. */
 vdev_ops_t vdev_tiering_ops = {
-    .vdev_op_open = vdev_tiering_open,
+    .vdev_op_init = NULL,   /* TODO find out what init does */
+    .vdev_op_fini = NULL,   /* TODO find out what fini does */
+    .vdev_op_open = vdev_tiering_open,  /* TODO study the change in open signature */
     .vdev_op_close = vdev_tiering_close,
     .vdev_op_asize = vdev_default_asize,    /* Use the default method since
  *                                             the tiering vdev does none of
  *                                             it's own allocations */
+    .vdev_op_min_asize = vdev_default_min_asize,  /* TODO find out min_asize does */
+    .vdev_op_min_alloc = NULL,  /* TODO find out min alloc does */
+
     .vdev_op_io_start = vdev_tiering_io_start,
     .vdev_op_io_done = vdev_tiering_io_done,
     .vdev_op_state_change = NULL,
@@ -1613,7 +1625,13 @@ vdev_ops_t vdev_tiering_ops = {
     .vdev_op_rele = NULL,
     .vdev_op_remap = NULL,
     .vdev_op_xlate = NULL,
+
+    .vdev_op_rebuild_asize = NULL,     /* TODO find out what this function does */
+    .vdev_op_metaslab_init = NULL,     /* TODO find out what this function does */
+    .vdev_op_config_generate = NULL,   /* TODO find out what this function does */
+    .vdev_op_nparity = NULL,           /* TODO find out what this function does */
+    .vdev_op_ndisks = NULL,           /* TODO find out what this function does */
+
     .vdev_op_type = VDEV_TYPE_TIERING,  /* Name of vdev type */
     .vdev_op_leaf = B_FALSE             /* Not a leaf vdev */
 };
-

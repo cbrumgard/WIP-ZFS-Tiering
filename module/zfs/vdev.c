@@ -1769,8 +1769,8 @@ vdev_default_open_children_func(vdev_t *vd)
 
 /*
  * Open the requested child vdevs.  If any of the leaf vdevs are using
- * a ZFS volume then do the opens in a single thread.  This avoids a
- * deadlock when the current thread is holding the spa_namespace_lock.
+ * a ZFS volume or use the tiering vdev then do the opens in a single thread.
+ * This avoids a deadlock when the current thread is holding the spa_namespace_lock.
  */
 static void
 vdev_open_children_impl(vdev_t *vd, vdev_open_children_func_t *open_func)
@@ -1787,7 +1787,8 @@ vdev_open_children_impl(vdev_t *vd, vdev_open_children_func_t *open_func)
 		if (open_func(cvd) == B_FALSE)
 			continue;
 
-		if (tq == NULL || vdev_uses_zvols(vd)) {
+		if (B_TRUE || tq == NULL || vdev_uses_zvols(vd) /*||
+		    vd->vdev_ops == &vdev_tiering_ops*/) {
 			cvd->vdev_open_error = vdev_open(cvd);
 		} else {
 			VERIFY(taskq_dispatch(tq, vdev_open_child,
