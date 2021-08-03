@@ -18,7 +18,7 @@
 #include "sys/zap.h"
 #include "sys/zfs_znode.h"
 
-typedef struct data_range data_range_t;
+//typedef struct data_range data_range_t;
 typedef struct tiering_map tiering_map_t;
 typedef struct tier tier_t;
 
@@ -82,7 +82,7 @@ struct perf_tier_alloc_tracker {
 };
 
 
-
+#if 0
 struct data_range {
 
     /* Pointer to the top private data structure */
@@ -127,51 +127,404 @@ struct data_range {
     struct perf_tier_alloc_tracker *perf_tier_alloc_tracker;
     uint64_t num_evict_rounds;
 };
+#endif
 
+/* TODO use the capabilities to control behavior of the tiers */
+#define TIER_VIRTUAL_ADDR_CAP 1<<1
+#define TIER_EVICT_CAP        1<<2
+#define TIER_MIGRATION_CAP    1<<3
+#define TIER_DEST_CAP         1<<4
 
 struct tier {
-    int (*init)(tier_t *, void *);
+    int  (*init)(tier_t *, void *, uint8_t capabilities);
     void (*fini)(tier_t *);
-    void (*allocate_space)(tier_t *);
+    void (*set_tiering_map)(tier_t *, tiering_map_t *);
+    void (*allocate_space)(tier_t *, uint64_t offset, uint64_t size, zio_t *zio);
     void (*deallocate_space)(tier_t *, u_int64_t offset, u_int64_t size);
-    int  (*write)(tier_t *tier, void *, uint64_t, uint64_t, dmu_tx_callback_func_t, void *);
-    int  (*read)(tier_t *, void *, uint64_t, uint64_t);
+    int  (*write)(tier_t *tier, void *, boolean_t, uint64_t, uint64_t, uint64_t, zio_t *, void *, uint64_t);
+    int  (*read)(tier_t *, void *, boolean_t, uint64_t, uint64_t, uint64_t, zio_t *);
+    int  (*evict)(tier_t *, uint64_t evict);
     void (*stats)(tier_t *);
 };
 
-struct spa_tier {
+
+
+struct tiering_map {
+
+    /* My vdev */
+    vdev_t *tiering_vdev;
+
+    /* Pointer to the performance tier vdev */
+    //vdev_t *performance_vdev;
+
+    tier_t *cap_tier;
+
+    tier_t *perf_tier;
+
+    
+
+    /* Pointer to the capacity tier vdev */
+    //vdev_t *capacity_vdev;
+
+    /*** Migration Control ***/
+
+    /* List of ranges (by offset and length) read to be read from
+     * the performance tier (buffer unfilled) */
+    list_t migration_queue;
+
+    /* List of ranges (by offset and length) ready to go on the capacity tier
+     * buffer filled */
+    // list_t to_capacity_tier_data_ranges;
+
+    /* Number of free migration buffers left */
+    uint64_t num_of_free_bufs;
+
+    /*   */
+    kmutex_t tiering_migration_thr_lock;
+
+    /*  */
+    kcondvar_t tiering_migration_thr_cv;
+
+    /* */
+    kthread_t *tiering_thread;
+
+    /* Flag for controlling the tiering thread */
+    u_int8_t tiering_thread_exit;
+
+    /*** Data Tracker ***/
+
+    /* Allocator tracker for the performance tier */
+    //struct perf_tier_alloc_tracker *perf_tier_alloc_tracker;
+};
+
+
+
+struct tier_dmu_impl {
 
     /* Composition inheritance of methods */
     struct tier t;
 
     /** Private members **/
     
+    /* Tiering map */
+    tiering_map_t *tiering_map;
+
     /* Object set for the tier */
     objset_t *objset; 
 
     /* Root dnode */
+    uint64_t root_id;
     dnode_t *root_dnode;
 
     uint64_t tiering_cache_id;
 
     /* SPA for the tier */
     /* TODO remove SPA */
-    spa_t *spa;
+    //spa_t *spa;
 
     /* last time (txg) tier was evicted */
-    uint64_t num_evict_rounds;
+    //uint64_t num_evict_rounds;
 
-    uint64_t base_txg;
+    //uint64_t base_txg;
 
-    // zio_t *root;
+    
+    /*** Cache control ***/
+    kmutex_t cache_lock;
+    kcondvar_t migrated_cv;
+
+    u_int64_t curr_cache_id;
+    
+    u_int64_t latest_txg;
+    //u_int64_t last_synced_txg;
+    //u_int64_t last_migrated_txg;
+
+    avl_tree_t cache_entries_by_id;
+    avl_tree_t cache_tree_by_txg_and_addr;
+    
+};
+
+struct dmu_tier_data_chunk_descriptor {
+
+    u_int64_t cache_id;
+    u_int64_t offset;
+    u_int64_t length;
+    
+
+    avl_node_t cache_link;
+
+    /* Buffer for holding capacity tier data */
+    uint64_t cap_info_length;
+    uint8_t cap_info[];
+};
+
+struct dmu_tier_cache_entry {
+
+    u_int64_t _cache_id;
+    u_int64_t dmu_object_id;
+
+    u_int64_t tier_txg;
+    
+    u_int32_t num_syncing;
+    
+    #define DMU_TIER_CACHE_ENTRY_CLEAN 0
+    #define DMU_TIER_CACHE_ENTRY_DIRTY 1
+    #define DMU_TIER_CACHE_ENTRY_SYNCED 2
+    #define DMU_TIER_CACHE_ENTRY_MIGRATING 4
+    #define DMU_TIER_CACHE_ENTRY_MIGRATED 8
+
+
+
+    u_int32_t status;
+    
+    struct tier_dmu_impl *dmu_tier;
+    avl_node_t link;
 };
 
 
+struct tier_zio_impl {
+
+    /* Composition inheritance of methods */
+    struct tier t;
+
+    /** Private members **/
+    
+    /* Tiering map */
+    tiering_map_t *tiering_map;
+
+    /* Vdev */
+    vdev_t *vdev;
+
+
+    /*** Cache control ***/
+    kmutex_t cache_lock;
+    kcondvar_t migrated_cv;
+
+    
+    u_int64_t latest_txg;
+    
+
+    avl_tree_t cache_tree_by_addr;
+    avl_tree_t cache_tree_by_txg_and_addr;
+};
+
+struct zio_tier_data_chunk_descriptor {
+
+    u_int64_t txg;
+    u_int64_t offset;
+    u_int64_t logical_offset;
+    u_int64_t length;
+    
+
+    u_int32_t num_syncing;
+    
+    #define ZIO_TIER_CACHE_ENTRY_CLEAN 0
+    #define ZIO_TIER_CACHE_ENTRY_DIRTY 1
+    #define ZIO_TIER_CACHE_ENTRY_SYNCED 2
+    #define ZIO_TIER_CACHE_ENTRY_MIGRATING 4
+    #define ZIO_TIER_CACHE_ENTRY_MIGRATED 8
+    u_int32_t status;
+
+    struct tier_zio_impl *zio_tier;
+
+    avl_node_t by_txg_and_addr_link;
+    avl_node_t by_addr_link;
+
+    /* Buffer for holding capacity tier data */
+    uint64_t cap_info_length;
+    uint8_t cap_info[];
+};
+
+
+// struct zio_tier_cache_entry {
+
+//     struct tier_zio_impl *zio_tier;
+
+//     u_int64_t txg;
+//     u_int32_t num_syncing;
+    
+//     #define ZIO_TIER_CACHE_ENTRY_CLEAN 0
+//     #define ZIO_TIER_CACHE_ENTRY_DIRTY 1
+//     #define ZIO_TIER_CACHE_ENTRY_SYNCED 2
+//     #define ZIO_TIER_CACHE_ENTRY_MIGRATING 4
+//     #define ZIO_TIER_CACHE_ENTRY_MIGRATED 8
+//     u_int32_t status;
+
+//     avl_node_t link;
+// };
+
+
+
+
+struct cap_info {
+    blkptr_t dest_blkptr;
+
+    /* TODO for Testing */
+    blkptr_t orig_blkptr;
+};
+
 
 static int
-spa_tier_init(tier_t *tier, void *arg) {
+_dmu_tier_get_or_allocate_data_cache_object(struct tier_dmu_impl *tier, 
+                                            uint64_t parent_txg, 
+                                            struct dmu_tier_cache_entry **cache_entry) {
 
-    struct spa_tier *spa_tier = (struct spa_tier *) tier;
+    dmu_tx_t *tx = NULL;
+    int rc = 0;
+
+    mutex_enter(&tier->cache_lock);
+
+    if(parent_txg > tier->curr_cache_id) {
+
+        do{
+            /* New transaction for this tier */
+            tx = dmu_tx_create(tier->objset);
+
+            ASSERT(tx != NULL);
+
+            /* TODO Replace this with a programmtical and settable approach */
+            #define TIERING_BLOCK_SIZE 512
+
+            /* Hold the cache zap and a small write for a new object to 
+             * be created */
+            dmu_tx_hold_zap(tx, tier->tiering_cache_id, B_TRUE, NULL);
+            dmu_tx_hold_write(tx, DMU_NEW_OBJECT, 0, 1);
+            //dmu_tx_hold_space(tx, 10 * 1024 * 1024);
+            
+            /* Assign the transaction to a group */
+            rc = dmu_tx_assign(tx, TXG_WAIT);
+
+            switch(rc) {
+
+                /* Success on the holds */
+                case 0:
+                    break;
+
+                /* Out of space, so abort the tx and let's try to evict 
+                 * some space */
+                case ENOSPC:
+                    dmu_tx_abort(tx);
+
+                    mutex_exit(&tier->cache_lock);
+
+                    ((tier_t *)tier)->evict((tier_t *)tier, TIERING_BLOCK_SIZE);
+
+                    mutex_enter(&tier->cache_lock);
+
+                    break;
+
+                /* Error */
+                default:
+                    dmu_tx_abort(tx);
+                    zfs_dbgmsg("Error creating tiering cache file, error = %d at %s@%d", rc, __FUNCTION__, __LINE__);
+                    ASSERT(rc == 0);
+                    break;
+            }
+            
+        } while(rc == ENOSPC);
+
+        /* Allocate a new cache object, this should never fail */
+        uint64_t cache_obj = dmu_object_alloc(tier->objset,
+                                              DMU_OT_PLAIN_FILE_CONTENTS, 
+                                              TIERING_BLOCK_SIZE, 
+                                              DMU_OT_NONE, 0,tx);
+
+        
+        /* Add the cache object id to the cache zap by the cache id 
+         * (original txg of the tiering vdev) */
+        rc = zap_add_int_key(tier->objset, tier->tiering_cache_id, parent_txg, 
+                            cache_obj, tx);
+        
+        ASSERT(rc == 0);
+
+        if(rc != 0) {
+            zfs_dbgmsg("Error creating tiering cache file, error = %d at %s@%d", rc, __FUNCTION__, __LINE__);
+        }
+
+        /* Commit */
+        dmu_tx_commit(tx);
+
+            
+        /* Create the cache entry */
+        /* TODO in the future may want to put this in the dnode bonus buffer */
+        *cache_entry = kmem_alloc(sizeof(struct dmu_tier_cache_entry), KM_SLEEP);
+
+        (*cache_entry)->_cache_id = tier->curr_cache_id = parent_txg;
+        (*cache_entry)->dmu_object_id = cache_obj;
+        (*cache_entry)->num_syncing = 1;
+        (*cache_entry)->dmu_tier = tier;
+        
+        (*cache_entry)->status = DMU_TIER_CACHE_ENTRY_DIRTY;
+
+        /* Add it to the tree */
+        avl_index_t where;
+
+        ASSERT(avl_find(&tier->cache_entries_by_id, *cache_entry, &where) == NULL);
+        avl_insert(&tier->cache_entries_by_id, *cache_entry, where);
+
+        zfs_dbgmsg("Created cache id %d at %s@%d", (*cache_entry)->_cache_id, __FUNCTION__, __LINE__);
+        
+    } else {
+
+        struct dmu_tier_cache_entry search_entry = {
+            ._cache_id = parent_txg,
+        };
+
+        *cache_entry = avl_find(&tier->cache_entries_by_id, &search_entry, NULL);
+
+        ASSERT(*cache_entry != NULL);
+
+        atomic_inc_32_nv(&(*cache_entry)->num_syncing);
+    }
+
+    mutex_exit(&tier->cache_lock);
+
+   
+    /* Return the success or failure */
+    return rc;
+}
+
+static int
+_dmu_cache_entry_tree_compare(const void *v1, const void *v2) {
+
+    const struct dmu_tier_cache_entry *ce1 = v1;
+    const struct dmu_tier_cache_entry *ce2 = v2;
+
+    if(ce1->_cache_id < ce2->_cache_id) {
+        return -1;
+    }else if(ce1->_cache_id > ce2->_cache_id) {
+        return 1;
+    }else {
+        return 0;
+    }
+}
+
+
+static int 
+_dmu_cache_tree_by_cache_id_and_addr_compare(const void *v1, const void *v2) {
+
+    const struct dmu_tier_data_chunk_descriptor *ck1 = v1;
+    const struct dmu_tier_data_chunk_descriptor *ck2 = v2;
+
+    if(ck1->cache_id < ck2->cache_id) {
+        return -1;
+    }else if(ck1->cache_id > ck2->cache_id) {
+        return 1;
+    }else {
+
+        if(ck1->offset < ck2->offset) {
+            return -1;
+        }else if(ck1->offset > ck2->offset) {
+            return 1;
+        }else {
+            return 0;
+        } 
+    }
+}
+
+static int
+tier_init_dmu_impl(tier_t *tier, void *arg, uint8_t req_capabilities) {
+
+    struct tier_dmu_impl *dmu_tier = (struct tier_dmu_impl *) tier;
     char *dataset_name = (char *) arg;
     objset_t *objset = NULL;
     uint64_t version;
@@ -180,8 +533,17 @@ spa_tier_init(tier_t *tier, void *arg) {
     dnode_t *root_dn = NULL;
     int rc = 0;
 
+
+    if(req_capabilities & TIER_DEST_CAP) {
+        zfs_dbgmsg("DMU tier does not support being a destination tier");
+        return ENOTSUP;
+    }else if(req_capabilities & ~(TIER_VIRTUAL_ADDR_CAP|TIER_EVICT_CAP|TIER_MIGRATION_CAP)) {
+        zfs_dbgmsg("Invalid capabilites given to DMU tier");
+        return EINVAL;
+    }
+
     /* Open the tier as a ZFS DMU objectset (TODO Might try another ZVOL or something else later) */
-    rc = dmu_objset_own(dataset_name, DMU_OST_ZFS, B_FALSE, B_TRUE, spa_tier, &objset);
+    rc = dmu_objset_own(dataset_name, DMU_OST_ZFS, B_FALSE, B_TRUE, dmu_tier, &objset);
     
     /* Error opening the object set */
     if(rc != 0) {
@@ -206,7 +568,7 @@ spa_tier_init(tier_t *tier, void *arg) {
     }
 
     /* Get the root dnode */
-    rc =  dnode_hold(objset, root_id, spa_tier, &root_dn);
+    rc = dnode_hold(objset, root_id, dmu_tier, &root_dn);
 
     if(rc != 0) {
         zfs_dbgmsg("Error opening dataset %s at %s@%d", dataset_name, __FUNCTION__, __LINE__);
@@ -232,14 +594,16 @@ spa_tier_init(tier_t *tier, void *arg) {
          * creating the file cache dmu object, add the it's id to the zap and then commit */
         case ENOENT: {
 
-                 
                 zfs_dbgmsg("Creating cache entry at %s@%d", __FUNCTION__, __LINE__);
         
                 /* New transaction for this tier */
                 dmu_tx_t *tx = dmu_tx_create(objset);
                 
                 /* Hold the root's zap for the transaction */
+                dmu_tx_hold_zap(tx, MASTER_NODE_OBJ, B_TRUE, NULL);
                 dmu_tx_hold_zap(tx, root_id, B_TRUE, NULL);
+                dmu_tx_hold_zap(tx, DMU_NEW_OBJECT, B_TRUE, NULL);
+
 
                 /* Assign the transaction to a group */
                 rc = dmu_tx_assign(tx, TXG_NOWAIT);
@@ -255,7 +619,8 @@ spa_tier_init(tier_t *tier, void *arg) {
 
                 /* Create a dmu file object. TODO: this function appears to never be checked in the code for
                    return value */
-                tiering_cache_id = dmu_object_alloc(objset, DMU_OT_PLAIN_FILE_CONTENTS, TIERING_BLOCK_SIZE, DMU_OT_SA,  0, tx);
+                //tiering_cache_id = dmu_object_alloc(objset, DMU_OTN_ZAP_DATA, TIERING_BLOCK_SIZE, DMU_OT_NONE,  0, tx);
+                tiering_cache_id = zap_create(objset, DMU_OTN_ZAP_METADATA, DMU_OT_NONE, 0, tx);
 
                 zfs_dbgmsg("Tiering cache id is %d at %s@%d", tiering_cache_id, __FUNCTION__, __LINE__);
                 
@@ -276,10 +641,9 @@ spa_tier_init(tier_t *tier, void *arg) {
 
                 /* Commit */
                 dmu_tx_commit(tx);                
-
+                
                 /* Wait for commit to finish */
                 txg_wait_synced(dmu_objset_pool(objset), txg);
-
 
                 
                 zfs_dbgmsg("Creating cache entry at %s@%d", __FUNCTION__, __LINE__);
@@ -297,12 +661,28 @@ spa_tier_init(tier_t *tier, void *arg) {
     ASSERT(objset != NULL);
     ASSERT(root_dn != NULL);
 
-
+    mutex_init(&dmu_tier->cache_lock, NULL, MUTEX_DEFAULT, NULL);
+    cv_init(&dmu_tier->migrated_cv, NULL, CV_DEFAULT, NULL);
     
+    avl_create(&dmu_tier->cache_entries_by_id, _dmu_cache_entry_tree_compare, 
+                sizeof(struct dmu_tier_cache_entry), 
+                offsetof(struct dmu_tier_cache_entry, link));
+
+    avl_create(&dmu_tier->cache_tree_by_txg_and_addr, 
+               _dmu_cache_tree_by_cache_id_and_addr_compare, 
+               sizeof(struct dmu_tier_data_chunk_descriptor), 
+               offsetof(struct dmu_tier_data_chunk_descriptor, cache_link));
+
     /* Assign the objset and root dnode (I have holds on both of them */
-    spa_tier->objset = objset;
-    spa_tier->root_dnode = root_dn;
-    spa_tier->tiering_cache_id = tiering_cache_id;
+    dmu_tier->objset = objset;
+    dmu_tier->root_dnode = root_dn;
+    dmu_tier->root_id = root_id;
+    dmu_tier->tiering_cache_id = tiering_cache_id;
+    dmu_tier->curr_cache_id = 0;
+
+    dmu_tier->latest_txg = 0;
+    
+   
 
     return 0;
 
@@ -312,32 +692,43 @@ spa_tier_init(tier_t *tier, void *arg) {
         if(objset != NULL) {
 
             if(root_dn != NULL) {
-                dnode_rele(root_dn, spa_tier);
+                dnode_rele(root_dn, dmu_tier);
             }
 
-            dmu_objset_disown(objset, B_TRUE, spa_tier);
+            dmu_objset_disown(objset, B_TRUE, dmu_tier);
         }
 
         return SET_ERROR(rc);
 }   
 
 static void
-spa_tier_fini(tier_t *tier) {
+tier_fini_dmu_impl(tier_t *tier) {
 
-    struct spa_tier *spa_tier = (struct spa_tier *) tier;
+    struct tier_dmu_impl *dmu_tier = (struct tier_dmu_impl *) tier;
 
-    if(spa_tier->objset != NULL) {
-        dmu_objset_disown(spa_tier->objset, B_FALSE, spa_tier);
+    if(dmu_tier->objset != NULL) {
+        dmu_objset_disown(dmu_tier->objset, B_FALSE, dmu_tier);
     }
 
-    if(spa_tier->root_dnode != NULL) {
-        dnode_rele(spa_tier->root_dnode, spa_tier);
+    if(dmu_tier->root_dnode != NULL) {
+        dnode_rele(dmu_tier->root_dnode, dmu_tier);
     }
 }
 
+static void 
+tier_set_tiering_map_dmu_impl(tier_t *tier, tiering_map_t *tiering_map) {
+    
+    struct tier_dmu_impl *dmu_tier = (struct tier_dmu_impl *) tier;
 
-struct spa_tier_private {
-    struct spa_tier *spa_tier;
+    dmu_tier->tiering_map = tiering_map;
+}
+
+
+
+
+
+struct dmu_tier_private {
+    struct tier_dmu_impl *dmu_tier;
     blkptr_t bp;
     zio_done_func_t *caller_cb;
     void *caller_private;
@@ -345,13 +736,13 @@ struct spa_tier_private {
 
 
 static void 
-spa_tier_deallocate_space(tier_t *tier, u_int64_t offset, u_int64_t size) {
+tier_deallocate_space_dmu_impl(tier_t *tier, u_int64_t offset, u_int64_t size) {
 
-    struct spa_tier *spa_tier = (struct spa_tier *) tier;
+    struct tier_dmu_impl *dmu_tier = (struct tier_dmu_impl *) tier;
 
     uint64_t refdbytesp, availbytesp, usedobjsp,availobjsp;
 
-    dmu_objset_space(spa_tier->objset, &refdbytesp, &availbytesp, &usedobjsp, 
+    dmu_objset_space(dmu_tier->objset, &refdbytesp, &availbytesp, &usedobjsp, 
                      &availobjsp);
 
     zfs_dbgmsg("Tier free at %ld of size %ld at %s@%d, bytes used = %ld space avaliable = %ld objs used = %ld avail objects = %ld", 
@@ -359,10 +750,10 @@ spa_tier_deallocate_space(tier_t *tier, u_int64_t offset, u_int64_t size) {
      
 
     /* New transaction for this tier */
-    dmu_tx_t *tx = dmu_tx_create(spa_tier->objset);
+    dmu_tx_t *tx = dmu_tx_create(dmu_tier->objset);
 
     /* Hold this section of the file in the transaction */
-    dmu_tx_hold_free(tx, spa_tier->tiering_cache_id, offset, size);
+    dmu_tx_hold_free(tx, dmu_tier->tiering_cache_id, offset, size);
 
     /* Mark this transaction as freeing space */
     dmu_tx_mark_netfree(tx);
@@ -375,7 +766,7 @@ spa_tier_deallocate_space(tier_t *tier, u_int64_t offset, u_int64_t size) {
     ASSERT(rc == 0);
 
     /* Frees this section of the object */
-    rc = dmu_free_range(spa_tier->objset, spa_tier->tiering_cache_id, 
+    rc = dmu_free_range(dmu_tier->objset, dmu_tier->tiering_cache_id, 
                             offset, size, tx);
 
     ASSERT(rc == 0);
@@ -391,15 +782,20 @@ spa_tier_deallocate_space(tier_t *tier, u_int64_t offset, u_int64_t size) {
      * a lot of transaction groups.  Probably need to change this
      * so this isn't required or move it to other calls when this needs to be 
      * done */
-    txg_wait_synced(dmu_objset_pool(spa_tier->objset), txg);
+    txg_wait_synced(dmu_objset_pool(dmu_tier->objset), txg);
 
-    dmu_objset_space(spa_tier->objset, &refdbytesp, &availbytesp, &usedobjsp, 
+    dmu_objset_space(dmu_tier->objset, &refdbytesp, &availbytesp, &usedobjsp, 
                      &availobjsp);
 
     zfs_dbgmsg("Done Tier free at %ld of size %ld at %s@%d, bytes used = %ld space avaliable = %ld objs used = %ld avail objects = %ld", 
     offset, size, __FUNCTION__, __LINE__, refdbytesp, availbytesp, usedobjsp,availobjsp);
      
 }
+
+
+
+
+
 
 // static void
 // //spa_tier_write_done(zio_t *zio) {
@@ -418,14 +814,439 @@ spa_tier_deallocate_space(tier_t *tier, u_int64_t offset, u_int64_t size) {
 //     kmem_free(private, sizeof(*private));
 // }
 
+typedef int (*tier_migration_read_func_t)(void *src_data, void *buf, uint64_t *offset, uint64_t *length, void **cap_data);
+typedef int (*tier_migration_write_func_t)(void *dst_data, void *buf, uint64_t offset, 
+                           uint64_t length, void *cap_data);
+typedef void (*tier_migration_done_func_t)(void *src_data, int status);
+
+struct migration_request {
+
+    list_node_t link;
+
+    void *src_data;
+    void *dst_data;
+
+    tier_migration_read_func_t src_read_func;
+    tier_migration_write_func_t dest_write_func;
+    tier_migration_done_func_t src_done_func;
+};    
+
+/**
+ * This read function works as iterator, each call will progressive higher 
+ * values until no data is available.  On first pass, buf, dest_offset and 
+ * dest_length should be set to NULL, 0, and 0 respectively. After that 
+ * they should have the value they were last set to on the previous call.
+ */
+static int
+_dmu_tier_migration_read(void *src_data, void *buf, uint64_t *dest_offset, 
+                         uint64_t *dest_length, void **cap_data) {
+    
+    /* Cast the source data to the cache entry */
+    struct dmu_tier_cache_entry *cache_entry = src_data;
+
+    struct dmu_tier_data_chunk_descriptor search = {
+        .cache_id = cache_entry->_cache_id,
+        .offset   = *dest_offset + *dest_length,
+        .length   = 0,
+    };
+
+    avl_index_t where;
+    int rc = 0;
+
+    // static uint64_t last_alloc_size = 0;
+
+    mutex_enter(&cache_entry->dmu_tier->cache_lock);
+    
+    /* Search for nearest chunk to dest offset */
+    struct dmu_tier_data_chunk_descriptor *data_chunk = 
+        avl_find(&cache_entry->dmu_tier->cache_tree_by_txg_and_addr, 
+                 &search, &where);
+
+    if(data_chunk == NULL) {
+        data_chunk = avl_nearest(
+                        &cache_entry->dmu_tier->cache_tree_by_txg_and_addr, 
+                        where, AVL_AFTER);
+    }
+    
+    mutex_exit(&cache_entry->dmu_tier->cache_lock);
+
+    /* Have found an entry for reading */
+    if(data_chunk != NULL && data_chunk->cache_id == cache_entry->_cache_id) {
+        
+        /* Read the data */
+        rc = dmu_read(cache_entry->dmu_tier->objset, cache_entry->dmu_object_id, 
+                      data_chunk->offset, data_chunk->length, buf, 
+                      DMU_READ_NO_PREFETCH);
+
+        /* Handle the read result */
+        switch(rc) {
+
+            /* Success */
+            case 0:
+                *dest_offset = data_chunk->offset;
+                *dest_length = data_chunk->length;
+                *cap_data = data_chunk->cap_info;
+                break;
+
+            /* Failure */
+            default:
+                // if(*buf != NULL) {
+                //     zfs_dbgmsg("Freeing chunk of size %ld", last_alloc_size);
+                //     kmem_free(*buf , last_alloc_size);
+                //     *buf = NULL;
+                // }
+                    
+                *dest_length = 0;
+                
+
+                break;
+        }
+
+    /* No data chunk available */
+    } else {
+
+        // if(*buf != NULL) {
+        //     zfs_dbgmsg("Freeing chunk of size %ld", last_alloc_size);
+        //     kmem_free(*buf , last_alloc_size);
+        //     *buf = NULL;
+        // }
+
+        *dest_offset = 0;
+        *dest_length = 0;
+
+        rc = ENOENT;
+    }
+
+    /* Return the result */
+    return rc;
+
+    // struct dmu_tier *tier = NULL;
+    // uint64_t cache_id = 0;
+    // uint64_t persistent_offset = 0;
+
+
+    // uint64_t start = persistent_offset;
+    // uint64_t end;
+
+    // int rc = dmu_offset_next(tier->objset, cache_id, B_FALSE, &start);
+    
+
+    // switch(rc) {
+
+    //     /* Next chunk found */
+    //     case 0:
+
+    //         rc = dmu_read(tier->objset, cache_id, persistent_offset, size, 
+    //                       buf, DMU_READ_NO_PREFETCH);
+
+    //         if(rc != 0) {
+    //             zfs_dbgmsg("Error reading data, error = %d at %s@%d", rc, __FUNCTION__, __LINE__);
+    //             return SET_ERROR(rc);
+    //         }
+            
+    //         break;
+
+    //     /* Out of chunks for this request */
+    //     case ESRCH:
+    //         break;
+
+    //     /* Error */
+    //     default:
+    //         break;
+    // }
+}
+
+
+static void
+_dmu_tier_migration_done(void *src_data, int status) {
+    
+    /* Cast the source data to the cache entry */
+    struct dmu_tier_cache_entry *cache_entry = src_data;
+
+    /* TODO if status is not 0, then we need to reissue again */
+    ASSERT(status == 0);
+
+    mutex_enter(&cache_entry->dmu_tier->cache_lock);
+
+    /* Not migrating any more */
+    cache_entry->status &= ~DMU_TIER_CACHE_ENTRY_MIGRATING;
+
+    /* Not dirty anymore */
+    if(status == 0) {
+        cache_entry->status &= ~DMU_TIER_CACHE_ENTRY_DIRTY;
+        cache_entry->status |= DMU_TIER_CACHE_ENTRY_MIGRATED;
+    }
+
+    /* Signal that data has been migrated */
+    cv_broadcast(&cache_entry->dmu_tier->migrated_cv);
+    mutex_exit(&cache_entry->dmu_tier->cache_lock);
+}
+
+static void
+_capacity_tier_migration_write_done(zio_t *zio) {
+    zfs_dbgmsg("off %llu len %llu io_error = %d", 
+        zio->io_offset, zio->io_size, zio->io_error);
+    
+    ASSERT(zio->io_error == 0);
+}
+
+struct _migration_write_done_data {
+    kmutex_t   write_done_lock;
+    kcondvar_t write_done_cv;
+    boolean_t  done;
+};
+
+static void
+_migration_write_done(zio_t *zio) {
+    zfs_dbgmsg("Migration write chunk done offset = %llu length %llu io_error = %d", 
+               zio->io_offset, zio->io_size, zio->io_error);
+
+    struct _migration_write_done_data *data = zio->io_private;
+
+    mutex_enter(&data->write_done_lock);
+    data->done = B_TRUE;
+    cv_signal(&data->write_done_cv);
+    mutex_exit(&data->write_done_lock);
+
+    ASSERT(zio->io_error == 0);
+}
+
+static int
+_capacity_tier_migration_write(void *dst_data, void *buf, uint64_t offset, 
+                               uint64_t length, void *cap_data) {
+
+    
+    
+    
+    struct _migration_write_done_data data;
+
+    int signalled = 0;
+    int rc = 0;
+
+    mutex_init(&data.write_done_lock, NULL, MUTEX_DEFAULT, NULL);
+    cv_init(&data.write_done_cv, NULL, CV_DEFAULT, NULL);   
+    data.done = B_FALSE;
+    
+    struct tier_zio_impl *zio_tier = dst_data;
+    
+
+    /* TODO change this eventually to just the dest_blkptr */
+    struct cap_info *cap_info = cap_data;
+
+    abd_t *abd_buf = abd_get_from_buf(buf, length);
+
+    
+    mutex_enter(&data.write_done_lock);
+
+    while(data.done == B_FALSE) {
+        
+        mutex_exit(&data.write_done_lock);
+
+        zfs_dbgmsg("Attempting offset %llu length %llu", offset, length);
+
+        /* Lock the spa and create a parent zio that will unlock it on
+         * completion of the io operations */
+        //spa_config_enter(tiering_map->performance_vdev->vdev_spa, SCL_ALL, FTAG, RW_READER);
+        spa_config_enter(zio_tier->vdev->vdev_spa, SCL_ALL, FTAG, RW_READER);
+
+        zio_t *parent_zio = zio_root(zio_tier->vdev->vdev_spa, 
+                                     _migration_write_done, &data, 0);
+        
+        zio_t *zio = zio_vdev_child_io(parent_zio,
+                                    &cap_info->orig_blkptr,
+                                    zio_tier->vdev,
+                                    offset,
+                                    abd_buf,
+                                    length,
+                                    ZIO_TYPE_WRITE,
+                                    ZIO_PRIORITY_ASYNC_WRITE,
+                                    0,
+                                    _capacity_tier_migration_write_done,
+                                    NULL);
+
+        ASSERT(zio != NULL && zio->io_error == 0);
+
+        zio_nowait(zio);
+
+        // zfs_dbgmsg("off %llu len %llu stage: %llu pipeline %llu trace_pipeline %llu", offset, length,
+        //         zio->io_stage, zio->io_pipeline, zio->io_pipeline_trace);
+        
+        rc = zio_wait(parent_zio);
+
+        ASSERT(rc == 0);
+
+        mutex_enter(&data.write_done_lock);
+
+        zfs_dbgmsg("offset %llu length %llu done is %d", offset, length, data.done);
+
+        if(data.done == B_FALSE) {
+            signalled = cv_timedwait(&data.write_done_cv, &data.write_done_lock, 
+                                    ddi_get_lbolt() + SEC_TO_TICK(5));
+        
+            if(signalled < 0) {
+                zfs_dbgmsg("timeout off %llu len %llu", offset, length);
+            }else {
+                zfs_dbgmsg("signalled off %llu len %llu", offset, length);
+            }
+        }
+        mutex_exit(&data.write_done_lock);
+
+        spa_config_exit(zio_tier->vdev->vdev_spa, SCL_ALL, FTAG);
+
+        
+        mutex_enter(&data.write_done_lock);
+    }
+
+    mutex_exit(&data.write_done_lock);
+
+    zfs_dbgmsg("done off %llu len %llu", offset, length);
+    
+    //abd_release_ownership_of_buf(abd_buf);
+    abd_free(abd_buf);
+
+    mutex_destroy(&data.write_done_lock);
+    cv_destroy(&data.write_done_cv);
+
+    return rc;
+}
+
+static void
+submit_for_migration(tiering_map_t *tiering_map, 
+                     tier_migration_read_func_t read_func,
+                     tier_migration_done_func_t done_func,
+                     void *src_data) {
+
+    zfs_dbgmsg("Submitting for migration");
+
+    struct migration_request *migration_request = kmem_alloc(
+        sizeof(struct migration_request), KM_SLEEP);
+
+    migration_request->src_read_func = read_func;
+    migration_request->src_data      = src_data;
+    migration_request->src_done_func = done_func;
+
+    /* TODO this is where the tiering map can use policy to decide where
+       to send the data to next and with what priority (For right now,
+       just hard code the capcity) */
+    migration_request->dest_write_func = _capacity_tier_migration_write;
+    migration_request->dst_data        = tiering_map->cap_tier;
+
+
+    mutex_enter(&tiering_map->tiering_migration_thr_lock);
+    
+    list_insert_head(&tiering_map->migration_queue, 
+                     migration_request);
+
+    cv_signal(&tiering_map->tiering_migration_thr_cv);        
+    mutex_exit(&tiering_map->tiering_migration_thr_lock);
+}
+
+
+
+
+
+static void 
+_dmu_tier_txg_is_synced(void *data, int error) {
+    
+    struct dmu_tier_cache_entry *cache_entry = data;
+
+    /* Decrement the number syncing */
+    uint32_t num_syncing = atomic_dec_32_nv(&cache_entry->num_syncing);
+    
+    zfs_dbgmsg("Cache id %d num_syncing %d at %s@%d", 
+        cache_entry->_cache_id, num_syncing, __FUNCTION__, __LINE__);
+
+
+    tiering_map_t *tiering_map = cache_entry->dmu_tier->tiering_map;
+
+    mutex_enter(&cache_entry->dmu_tier->cache_lock);
+
+    /* Check on the previous entry to see if it have been migrated,
+        * if not migrate them */
+    struct dmu_tier_cache_entry *prev_cache_entry = cache_entry;
+    struct dmu_tier_cache_entry *curr_cache_entry = cache_entry;
+
+        //AVL_PREV(&cache_entry->dmu_tier->cache_entries_by_id, cache_entry);
+
+    while(prev_cache_entry != NULL && 
+          (prev_cache_entry->status & DMU_TIER_CACHE_ENTRY_MIGRATING) == 0 &&
+          (prev_cache_entry->status & DMU_TIER_CACHE_ENTRY_MIGRATED) == 0) {
+
+        curr_cache_entry = prev_cache_entry;
+
+        prev_cache_entry = 
+            AVL_PREV(&cache_entry->dmu_tier->cache_entries_by_id, curr_cache_entry);
+    }
+    
+    /* If this entry isn't the top of the cache stack then it's okay to 
+     * put on the migration list (Once it's not the top, ) */
+    while(curr_cache_entry->num_syncing == 0 &&
+          curr_cache_entry != avl_last(&cache_entry->dmu_tier->cache_entries_by_id) &&
+          (curr_cache_entry->status & DMU_TIER_CACHE_ENTRY_MIGRATING) == 0 &&
+          (curr_cache_entry->status & DMU_TIER_CACHE_ENTRY_MIGRATED) == 0) {
+
+            zfs_dbgmsg("Cache id %d is submitted (status = %d) at %s@%d", 
+                curr_cache_entry->_cache_id, 
+                curr_cache_entry->status, __FUNCTION__, __LINE__);
+
+            curr_cache_entry->status |= DMU_TIER_CACHE_ENTRY_MIGRATING;
+            curr_cache_entry->status |= DMU_TIER_CACHE_ENTRY_SYNCED;
+            
+            
+            submit_for_migration(tiering_map, _dmu_tier_migration_read, 
+                                    _dmu_tier_migration_done, curr_cache_entry);
+        
+            if(curr_cache_entry == cache_entry) {
+                break;
+            }
+
+            curr_cache_entry = AVL_NEXT(&cache_entry->dmu_tier->cache_entries_by_id, 
+                                        curr_cache_entry);
+    }
+
+    // if(num_syncing == 0) {
+    //     /* If this entry isn't the top of the cache stack then it's okay to 
+    //        put on the migration list (Once it's not the top, ) */
+    //     if(avl_last(&cache_entry->dmu_tier->cache_entries_by_id) != cache_entry) {
+
+    //         ASSERT((cache_entry->status & DMU_TIER_CACHE_ENTRY_MIGRATING) == 0);
+    //         ASSERT((cache_entry->status & DMU_TIER_CACHE_ENTRY_MIGRATED) == 0);
+            
+    //         zfs_dbgmsg("Cache id %d is submitted (status = %d) at %s@%d", cache_entry->cache_id, cache_entry->status, __FUNCTION__, __LINE__);
+
+    //         cache_entry->status |= 
+    //             DMU_TIER_CACHE_ENTRY_MIGRATING | DMU_TIER_CACHE_ENTRY_SYNCED;
+
+    //         submit_for_migration(tiering_map, _dmu_tier_migration_read, 
+    //                              _dmu_tier_migration_done, cache_entry);
+    //     }
+
+    // }
+        
+    mutex_exit(&cache_entry->dmu_tier->cache_lock);
+    
+
+    // tiering_map_t *tiering_map = NULL;
+
+    // mutex_enter(&tiering_map->tiering_migration_thr_lock);
+
+    // list_insert_head(&tiering_map->from_performance_tier_data_ranges, ???);
+
+    // cv_signal(&tiering_map->tiering_migration_thr_cv);
+
+    // mutex_exit(&tiering_map->tiering_migration_thr_lock);
+
+}
+
 
 
 //static zio_t *
 static int
-spa_tier_write(tier_t *tier, void *buf, uint64_t offset, uint64_t size, 
-               dmu_tx_callback_func_t cb, void *cb_data) {
+tier_write_dmu_impl(tier_t *tier, void *buf, boolean_t is_abd_buf, uint64_t txg, 
+                    uint64_t offset, uint64_t size, zio_t *zio, void *cap_info, 
+                    uint64_t cap_info_length) {
 
-    struct spa_tier *spa_tier = (struct spa_tier *) tier;
+    struct tier_dmu_impl *dmu_tier = (struct tier_dmu_impl *) tier;
 
     // uint64_t adjusted_txg = spa_tier->spa->spa_dsl_pool->dp_tx.tx_open_txg; //spa_tier->base_txg + txg;
     // zio_prop_t zp;
@@ -479,52 +1300,96 @@ spa_tier_write(tier_t *tier, void *buf, uint64_t offset, uint64_t size,
 
     // ASSERT(zio != NULL);
 
+    uint64_t parent_txg = txg;
+    struct dmu_tier_cache_entry *cache_entry = NULL;
 
-    uint64_t refdbytesp, availbytesp, usedobjsp,availobjsp;
+    void *raw_buf = (is_abd_buf) ? abd_to_buf(buf): buf;
 
-    dmu_objset_space(spa_tier->objset, &refdbytesp, &availbytesp, &usedobjsp, 
-                     &availobjsp);
-    zfs_dbgmsg("Tier write at %ld of size %ld at %s@%d, bytes used = %ld space avaliable = %ld objs used = %ld avail objects = %ld", 
-    offset, size, __FUNCTION__, __LINE__, refdbytesp, availbytesp, usedobjsp,availobjsp);
-     
+    
+    /* Get the tx for the cache file */
+    int rc = _dmu_tier_get_or_allocate_data_cache_object(dmu_tier, 
+                                                         parent_txg, 
+                                                         &cache_entry);
+
+    ASSERT(rc == 0);
+
     /* New transaction for this tier */
-    dmu_tx_t *tx = dmu_tx_create(spa_tier->objset);
+    dmu_tx_t *tx = dmu_tx_create(dmu_tier->objset);
+
+    ASSERT(tx != NULL);
 
     /* Hold this section of the tier file */
-    dmu_tx_hold_write(tx, spa_tier->tiering_cache_id, offset, size);
+    dmu_tx_hold_write(tx, cache_entry->dmu_object_id, offset, size);
 
     /* Assign the transaction to a group */
-    int rc = dmu_tx_assign(tx, TXG_WAIT);
+    rc = dmu_tx_assign(tx, TXG_WAIT);
 
     if(rc != 0) {
         zfs_dbgmsg("Error creating transaction, error = %d at %s@%d", rc, __FUNCTION__, __LINE__);
         dmu_tx_abort(tx);
+        atomic_dec_32_nv(&cache_entry->num_syncing);
         return SET_ERROR(rc);
     }
- 
-    /* Issue the write via the dmu */
-    dmu_write(spa_tier->objset, spa_tier->tiering_cache_id, offset, size, buf, tx);
     
-    /* Register the finished call back */
-    dmu_tx_callback_register(tx, cb, cb_data);
+    
+    /* Issue the write via the dmu */
+    dmu_write(dmu_tier->objset, cache_entry->dmu_object_id, offset, size, 
+              raw_buf, tx);
 
+    
     /* Get the transaction handle */
-    uint64_t txg = dmu_tx_get_txg(tx);
+    uint64_t dmu_tier_txg = dmu_tx_get_txg(tx);
+    
+
+    avl_index_t where;
+    struct dmu_tier_data_chunk_descriptor chunk = {
+        .cache_id = cache_entry->_cache_id,
+        .offset = offset,
+        .length = size,
+    };
+
+    
+    mutex_enter(&dmu_tier->cache_lock);
+    
+    if(dmu_tier->latest_txg < dmu_tier_txg) {
+        dmu_tier->latest_txg = dmu_tier_txg;
+
+        cache_entry->tier_txg = dmu_tier_txg;
+
+        /* Register the finished call back */
+        dmu_tx_callback_register(tx, _dmu_tier_txg_is_synced, cache_entry);
+    }
+
+    struct dmu_tier_data_chunk_descriptor *found = avl_find(&dmu_tier->cache_tree_by_txg_and_addr, &chunk, &where);
+
+    if(found == NULL) {
+        struct dmu_tier_data_chunk_descriptor *alloc_chunk = 
+                kmem_alloc(sizeof(struct dmu_tier_data_chunk_descriptor)+cap_info_length, 
+                KM_SLEEP);
+
+        memcpy(alloc_chunk, &chunk, sizeof(struct dmu_tier_data_chunk_descriptor));
+        memcpy(alloc_chunk->cap_info, cap_info, cap_info_length);
+        alloc_chunk->cap_info_length = cap_info_length;
+
+        avl_insert(&dmu_tier->cache_tree_by_txg_and_addr, alloc_chunk, where);
+    }
+
+    mutex_exit(&dmu_tier->cache_lock);
 
     /* Commit */
-    dmu_tx_commit(tx);   
-
+    dmu_tx_commit(tx);
+    
     /* TODO This forces the transaction group to proceed but creates
      * a lot of transaction groups.  Probably need to change this
      * so this isn't required or move it to other calls when this needs to be 
      * done */
-    txg_wait_synced(dmu_objset_pool(spa_tier->objset), txg);
+    txg_wait_synced(dmu_objset_pool(dmu_tier->objset), dmu_tier_txg);
+   
 
-
-    dmu_objset_space(spa_tier->objset, &refdbytesp, &availbytesp, &usedobjsp, 
-                     &availobjsp);
-    zfs_dbgmsg("Done Tier write at %ld of size %ld at %s@%d, bytes used = %ld space avaliable = %ld objs used = %ld avail objects = %ld", 
-    offset, size, __FUNCTION__, __LINE__, refdbytesp, availbytesp, usedobjsp,availobjsp);
+    // dmu_objset_space(dmu_tier->objset, &refdbytesp, &availbytesp, &usedobjsp, 
+    //                  &availobjsp);
+    // zfs_dbgmsg("Done Tier write at %ld of size %ld at %s@%d, bytes used = %ld space avaliable = %ld objs used = %ld avail objects = %ld", 
+    // offset, size, __FUNCTION__, __LINE__, refdbytesp, availbytesp, usedobjsp,availobjsp);
      
     //return zio;
 
@@ -551,11 +1416,37 @@ spa_tier_write(tier_t *tier, void *buf, uint64_t offset, uint64_t size,
 //     kmem_free(private, sizeof(*private));
 // }
 
-static int
-spa_tier_read(tier_t *tier, void *buf, 
-              uint64_t offset, uint64_t size) {
+struct tier_read_dmu_impl_abd_iter_read_func_priv {
+    struct tier_dmu_impl *tier;
+    u_int64_t cache_obj;
+    u_int64_t offset;
+    u_int64_t size;
+};
 
-    struct spa_tier *spa_tier = (struct spa_tier *) tier;
+
+static int
+tier_read_dmu_impl_abd_iter_read_func(void *buf, size_t len, void *priv) {
+
+    struct tier_read_dmu_impl_abd_iter_read_func_priv *read_data = priv;
+
+
+    int rc = dmu_read(read_data->tier->objset, read_data->cache_obj, 
+                      read_data->offset, len, buf, DMU_READ_NO_PREFETCH);
+
+    if(rc == 0) {
+        read_data->offset += len;
+    }
+
+    zfs_dbgmsg("abd_iter_tier_read_func rc = %d", rc);
+
+    return rc;
+}
+
+static int
+tier_read_dmu_impl(tier_t *tier, void *buf, boolean_t is_abd_buf, uint64_t txg, 
+                   uint64_t offset, uint64_t size, zio_t *zio) {
+
+    struct tier_dmu_impl *dmu_tier = (struct tier_dmu_impl *) tier;
 
     // /* Create and initialize the private data */
     // struct spa_tier_private *private = kmem_alloc(sizeof(struct spa_tier_private), KM_SLEEP);
@@ -585,45 +1476,233 @@ spa_tier_read(tier_t *tier, void *buf,
     // return zio;
 
 
-    zfs_dbgmsg("Tier read at %ld of size %ld at %s@%d", offset, size, __FUNCTION__, __LINE__);
-        
+    uint64_t cache_obj;
 
-    /* New transaction for this tier */
-    //dmu_tx_t *tx = dmu_tx_create(spa_tier->objset);
-
-    int rc = dmu_read(spa_tier->objset, spa_tier->tiering_cache_id, offset, size, 
-              buf, DMU_READ_NO_PREFETCH);
+    int rc = zap_lookup_int_key(dmu_tier->objset, dmu_tier->tiering_cache_id, txg, &cache_obj);
 
     if(rc != 0) {
         zfs_dbgmsg("Error reading data, error = %d at %s@%d", rc, __FUNCTION__, __LINE__);
         return SET_ERROR(rc);
     }
 
-    zfs_dbgmsg("Done Tier read at %ld of size %ld at %s@%d", offset, size, __FUNCTION__, __LINE__);
+    zfs_dbgmsg("Tier read with txg = %llu at %ld of size %ld at %s@%d", 
+                txg, offset, size, __FUNCTION__, __LINE__);
+        
+
+    /* Read into abd buffer  */
+    if(is_abd_buf) {
+
+        abd_t *abd_buf = buf;
+
+        /* Linear buffer so just get a reference to the raw buffer */
+        if(abd_is_linear(abd_buf)) {
+            rc = dmu_read(dmu_tier->objset, cache_obj, offset, size, 
+                          abd_to_buf(buf), DMU_READ_NO_PREFETCH);
+
+        /* Scattered buffer so need to iterate over buffers calling
+           the read function */
+        } else {
+
+            struct tier_read_dmu_impl_abd_iter_read_func_priv priv = {
+                .tier   = dmu_tier,
+                .cache_obj = cache_obj,
+                .offset = offset,
+                .size   = size
+            };
+
+            rc = abd_iterate_func(zio->io_abd, 0, zio->io_size,  
+                                  tier_read_dmu_impl_abd_iter_read_func, &priv);
+        }
+
+
+    /* Read into raw void * buffer */
+    } else {
+        rc = dmu_read(dmu_tier->objset, cache_obj, offset, size, 
+                      buf, DMU_READ_NO_PREFETCH);
+    }
+
+
+    if(rc != 0) {
+        zfs_dbgmsg("Error reading data, error = %d at %s@%d", rc, __FUNCTION__, __LINE__);
+        return SET_ERROR(rc);
+    }
+
+    zfs_dbgmsg("Done Tier read with txg = %llu at %ld of size %ld at %s@%d", 
+                txg, offset, size, __FUNCTION__, __LINE__);
         
 
     return 0;
 }
 
+static void 
+_dmu_tier_eviction_is_synced(void *data, int error) {
 
+    zfs_dbgmsg("error = %d at %s@%d", 
+        error, __FUNCTION__, __LINE__);
+}
+
+static int 
+tier_evict_dmu_impl(tier_t *tier, uint64_t to_evict) {
+
+    struct tier_dmu_impl *dmu_tier = (struct tier_dmu_impl *) tier;
+
+    uint64_t txg = 0;
+    uint64_t evicted=0;
+
+    ASSERT(MUTEX_HELD(&dmu_tier->cache_lock) == 0);
+
+    mutex_enter(&dmu_tier->cache_lock);
+
+    //dmu_object_next
+    //dmu_offset_next
+
+    while(evicted < to_evict) {
+        
+        struct dmu_tier_cache_entry *cache_entry = 
+                    avl_first(&dmu_tier->cache_entries_by_id);
+
+        zfs_dbgmsg("Cache id %d status = %d last txg = %d at %s@%d", cache_entry->_cache_id, 
+                    cache_entry->status, cache_entry->tier_txg, __FUNCTION__, __LINE__);
+
+        //txg_wait_synced(dmu_objset_pool(dmu_tier->objset), cache_entry->tier_txg);
+        
+        /* Check that cache entry is not dirty, syncing or migrating and that it
+        * is not at the top of the cache stack */
+        if(((cache_entry->status & 
+            (DMU_TIER_CACHE_ENTRY_DIRTY|DMU_TIER_CACHE_ENTRY_MIGRATING)) == 0) &&
+            ((cache_entry->status & DMU_TIER_CACHE_ENTRY_SYNCED) == DMU_TIER_CACHE_ENTRY_SYNCED) &&
+            AVL_NEXT(&dmu_tier->cache_entries_by_id, cache_entry) != NULL) {
+
+            zfs_dbgmsg("Releasing cache id = %d", cache_entry->_cache_id);
+
+            dmu_tx_t *tx = dmu_tx_create(dmu_tier->objset);
+
+            /* Mark this transaction as freeing space or it won't get cancelled 
+            if we are out of space */
+            dmu_tx_mark_netfree(tx);
+
+            dmu_tx_hold_free(tx, cache_entry->dmu_object_id, 0, DMU_OBJECT_END);
+            dmu_tx_hold_zap(tx, dmu_tier->tiering_cache_id, B_FALSE, NULL);
+
+            int rc = dmu_tx_assign(tx, TXG_WAIT);
+
+            ASSERT(rc == 0);
+
+            rc = dmu_object_free(dmu_tier->objset, cache_entry->dmu_object_id, tx);
+
+            ASSERT(rc == 0);
+
+            rc = zap_remove_int(dmu_tier->objset, dmu_tier->tiering_cache_id, cache_entry->_cache_id, tx);
+
+            ASSERT(rc == 0);
+
+            dmu_tx_callback_register(tx, _dmu_tier_eviction_is_synced, NULL);
+
+            /* Get the transaction handle */
+            txg = dmu_tx_get_txg(tx);
+
+            dmu_tx_commit(tx);
+
+
+            
+
+            uint64_t cache_entry_size = 0;
+
+            /* Free the data chunks will we wait on the deleteion to finish */
+            while(1) {
+
+                avl_index_t where;
+                
+
+                struct dmu_tier_data_chunk_descriptor search_data_chunk = {
+                    .cache_id = cache_entry->_cache_id,
+                    .offset   = 0,
+                }; 
+
+
+                struct dmu_tier_data_chunk_descriptor *data_chunk = 
+                    avl_find(&dmu_tier->cache_tree_by_txg_and_addr, &search_data_chunk, &where);
+                
+                if(data_chunk == NULL) {
+                    data_chunk = avl_nearest(&dmu_tier->cache_tree_by_txg_and_addr, where, AVL_AFTER);
+                }
+                
+                if(data_chunk != NULL && data_chunk->cache_id == cache_entry->_cache_id) {
+
+                    avl_remove(&dmu_tier->cache_tree_by_txg_and_addr, data_chunk);
+
+                    evicted += data_chunk->length;
+                    cache_entry_size += data_chunk->length;
+
+                    kmem_free(data_chunk, data_chunk->cap_info_length);
+                }else {
+                    break;
+                }
+            }
+            
+            zfs_dbgmsg("Evicted Cache id = %d size = %llu", cache_entry->_cache_id, cache_entry_size);
+               
+
+            avl_remove(&dmu_tier->cache_entries_by_id, cache_entry);
+            kmem_free(cache_entry, sizeof(*cache_entry));
+
+                 
+            if(txg != 0) {
+                txg_wait_synced(dmu_objset_pool(dmu_tier->objset), txg);
+
+                uint64_t refdbytesp, availbytesp, usedobjsp,availobjsp;
+
+                dmu_objset_space(dmu_tier->objset, &refdbytesp, &availbytesp, &usedobjsp, 
+                                &availobjsp);
+
+   
+                zfs_dbgmsg("bytes used = %ld space avaliable = %ld objs used = %ld avail objects = %ld at %s@%d", 
+                    refdbytesp, availbytesp, usedobjsp, availobjsp, __FUNCTION__, __LINE__);
+            }
+
+        /* Nothing available so wait until we are signaled */
+        } else {
+
+            zfs_dbgmsg("Waiting");
+            cv_timedwait(&dmu_tier->migrated_cv, &dmu_tier->cache_lock, 
+                         ddi_get_lbolt() + SEC_TO_TICK(10));
+            zfs_dbgmsg("Awoke with evicted = %d and need %d", evicted, to_evict);
+        }
+    }
+
+    mutex_exit(&dmu_tier->cache_lock);
+
+
+    
+
+    zfs_dbgmsg("Evicted = %d", evicted);
+
+
+
+    return evicted;
+}
 
 static tier_t *
-allocate_spa_tier(void) {
+allocate_dmu_tier(void) {
 
-    struct spa_tier *tier = kmem_alloc(sizeof(struct spa_tier), KM_SLEEP);
+    struct tier_dmu_impl *tier = kmem_alloc(sizeof(struct tier_dmu_impl), KM_SLEEP);
 
-    tier->t.init = spa_tier_init;
-    tier->t.fini = spa_tier_fini;
+    /* Set the instance methods */
+    tier->t.init =  tier_init_dmu_impl;
+    tier->t.fini = tier_fini_dmu_impl;
+    tier->t.set_tiering_map = tier_set_tiering_map_dmu_impl;
     tier->t.allocate_space = NULL;
-    tier->t.deallocate_space = spa_tier_deallocate_space;
-    tier->t.write = spa_tier_write;
-    tier->t.read = spa_tier_read;
+    tier->t.deallocate_space = tier_deallocate_space_dmu_impl;
+    tier->t.write = tier_write_dmu_impl;
+    tier->t.read = tier_read_dmu_impl;
+    tier->t.evict = tier_evict_dmu_impl;
     tier->t.stats = NULL;
 
-    tier->spa = NULL;
+    /* Set the private variables */
+    tier->tiering_map = NULL;
     tier->objset = NULL;
     tier->root_dnode = NULL;
-    tier->num_evict_rounds = 0;
+    //tier->num_evict_rounds = 0;
     
     // tier->base_txg = spa_syncing_txg(spa);
     // tier->root = zio_root(spa, NULL, NULL, 0);
@@ -634,49 +1713,510 @@ allocate_spa_tier(void) {
 }
 
 
+static int
+_zio_cache_tree_by_addr_compare(const void *v1, const void *v2) {
+
+    const struct zio_tier_data_chunk_descriptor *cd1 = v1;
+    const struct zio_tier_data_chunk_descriptor *cd2 = v2;
+
+    if(cd1->offset < cd2->offset) {
+        return -1;
+    }else if(cd1->offset > cd2->offset) {
+        return 1;
+    }else {
+        return 0;
+    }
+}
 
 
-struct tiering_map {
+static int 
+_zio_cache_tree_by_txg_and_addr_compare(const void *v1, const void *v2) {
 
-    /* My vdev */
-    vdev_t *tiering_vdev;
+    const struct zio_tier_data_chunk_descriptor *cd1 = v1;
+    const struct zio_tier_data_chunk_descriptor *cd2 = v2;
 
-    /* Pointer to the performance tier vdev */
-    //vdev_t *performance_vdev;
+    if(cd1->txg < cd2->txg) {
+        return -1;
+    }else if(cd1->txg > cd2->txg) {
+        return 1;
+    }else {
 
-    tier_t *perf_tier;
+        if(cd1->offset < cd2->offset) {
+            return -1;
+        }else if(cd1->offset > cd2->offset) {
+            return 1;
+        }else {
+            return 0;
+        } 
+    }
+}
 
-    /* Pointer to the capacity tier vdev */
-    vdev_t *capacity_vdev;
+static int
+tier_init_zio_impl(tier_t *tier, void *arg, uint8_t req_capabilities) {
 
-    /* List of ranges (by offset and length) read to be read from
-     * the performance tier (buffer unfilled) */
-    list_t from_performance_tier_data_ranges;
+    struct tier_zio_impl *zio_tier = (struct tier_zio_impl *) tier;
+    vdev_t *vdev = (vdev_t *) arg;
+    int rc = 0;
 
-    /* List of ranges (by offset and length) ready to go on the capacity tier
-     * buffer filled */
-    list_t to_capacity_tier_data_ranges;
 
-    /* Number of free migration buffers left */
-    uint64_t num_of_free_bufs;
 
-    /*   */
-    kmutex_t tiering_migration_thr_lock;
+    if(req_capabilities & TIER_VIRTUAL_ADDR_CAP) {
+        zfs_dbgmsg("ZIO tier does not support virtual addressing");
+        return ENOTSUP;
+    } else if(req_capabilities & TIER_EVICT_CAP) {
+        zfs_dbgmsg("ZIO tier does not support eviction");
+        return ENOTSUP;
+    } else if(req_capabilities & TIER_MIGRATION_CAP) {
+        zfs_dbgmsg("ZIO tier does not support migration");
+        return ENOTSUP;
+    }else if(req_capabilities & ~(TIER_VIRTUAL_ADDR_CAP|TIER_EVICT_CAP|TIER_MIGRATION_CAP|TIER_DEST_CAP)) {
+        zfs_dbgmsg("Invalid capabilites given to ZIO tier");
+        return EINVAL;
+    }
 
-    /*  */
-    kcondvar_t tiering_migration_thr_cv;
+    if((req_capabilities & TIER_DEST_CAP) == 0) {
+        zfs_dbgmsg("ZIO tier must be a destination tier");
+        return EINVAL;
+    }
 
-    /* */
-    kthread_t *tiering_thread;
 
-    /* Flag for controlling the tiering thread */
-    u_int8_t tiering_thread_exit;
+    zio_tier->tiering_map = NULL;    
+    zio_tier->vdev = vdev;
+    zio_tier->latest_txg = 0;
 
-    /* Allocator tracker for the performance tier */
-    struct perf_tier_alloc_tracker *perf_tier_alloc_tracker;
+    mutex_init(&zio_tier->cache_lock, NULL, MUTEX_DEFAULT, NULL);
+    cv_init(&zio_tier->migrated_cv, NULL, CV_DEFAULT, NULL);
+
+    avl_create(&zio_tier->cache_tree_by_txg_and_addr, 
+               _zio_cache_tree_by_txg_and_addr_compare, 
+               sizeof(struct zio_tier_data_chunk_descriptor), 
+               offsetof(struct zio_tier_data_chunk_descriptor, by_txg_and_addr_link));
+
+    avl_create(&zio_tier->cache_tree_by_addr, _zio_cache_tree_by_addr_compare, 
+                sizeof(struct zio_tier_data_chunk_descriptor), 
+                offsetof(struct zio_tier_data_chunk_descriptor, by_addr_link));
+
+    
+
+    return rc;
+}
+
+static void
+tier_fini_zio_impl(tier_t *tier) {
+
+    struct tier_zio_impl *zio_tier = (struct tier_zio_impl *) tier;
+
+    mutex_destroy(&zio_tier->cache_lock);
+    cv_destroy(&zio_tier->migrated_cv);
+
+    avl_destroy(&zio_tier->cache_tree_by_txg_and_addr);
+    avl_destroy(&zio_tier->cache_tree_by_addr);
+    
+}
+
+
+static void 
+tier_set_tiering_map_zio_impl(tier_t *tier, tiering_map_t *tiering_map) {
+    
+    struct tier_zio_impl *zio_tier = (struct tier_zio_impl *) tier;
+
+    zio_tier->tiering_map = tiering_map;
+}
+
+
+static void
+tier_allocate_space_zio_impl_done(zio_t *zio) {
+
+    ASSERT(zio->io_error == 0);
+}
+
+
+static void 
+tier_allocate_space_zio_impl(tier_t *tier, uint64_t offset, uint64_t size, 
+                             zio_t *zio) {
+
+    struct tier_zio_impl *zio_tier = (struct tier_zio_impl *) tier;
+
+    /* Create a child vdev io that allocates on this tier */
+    zio_nowait(zio_vdev_child_io(zio,
+                                 zio->io_bp,
+                                 zio_tier->vdev,
+                                 offset,
+                                 NULL,
+                                 size,
+                                 zio->io_type,
+                                 zio->io_priority,
+                                 zio->io_flags | ZIO_FLAG_NODATA,
+                                 tier_allocate_space_zio_impl_done,
+                                 NULL));
+}
+
+
+static void
+tier_read_zio_impl_done(zio_t *zio) {
+    
+    if(zio->io_error != 0) {
+        vdev_dbgmsg(zio->io_vd, "Read error at offset %llu length: %llu written at %llu buffer is linear %d",
+           zio->io_offset-(4*1024*1024), zio->io_size, zio->io_txg, abd_is_linear(zio->io_abd));
+    }
+
+    ASSERT(zio->io_error == 0);
+
+    if(zio->io_private != NULL) {
+        abd_free((abd_t *)zio->io_private);
+    }
+}
+
+
+static int
+tier_read_zio_impl(tier_t *tier, void *buf, boolean_t is_abd_buf, 
+                   uint64_t txg, uint64_t offset, uint64_t size, zio_t *zio) {
+
+    struct tier_zio_impl *zio_tier = (struct tier_zio_impl *) tier;
+
+    abd_t *abd_buf;
+    abd_t *abd_buf_to_free;
+
+    /* If the buffer is not an abd buffer (raw void *) then create a abd wrapper 
+     * for it and set the parameter for freeing the abd wrapper when done */
+    if(is_abd_buf == B_FALSE) {
+        abd_buf = abd_get_from_buf(buf, size);
+        abd_buf_to_free = abd_buf;
+
+    /* If it is an abd buffer, than just use it and not free it when done */
+    } else {
+        abd_buf = buf;
+        abd_buf_to_free = NULL;
+    }
+
+    /* Schedule a read on the capacity tier */
+    zio_nowait(
+            zio_vdev_child_io(zio,
+                              zio->io_bp,
+                              zio_tier->vdev,
+                              offset,
+                              abd_buf,
+                              size,
+                              zio->io_type,
+                              zio->io_priority,
+                              0,
+                              tier_read_zio_impl_done,
+                              abd_buf_to_free));
+
+    /* TODO We always return 0 because this function is asynchrous might need
+     * to change this later */
+    return 0;
+}
+
+static void _zio_tier_migration_read_done(zio_t *zio) {
+
+    ASSERT(zio->io_error == 0);
+
+    int *child_status = zio->io_private;
+
+    *child_status = zio->io_error;
+}
+
+static int 
+_zio_tier_migration_read(void *src_data, void *buf, uint64_t *offset, 
+                         uint64_t *length, 
+                         void **cap_data) {
+
+    /* Out of data for this length of data */
+    if(*offset != 0) {
+        return ENOENT;
+    }
+
+    /* Get the data chunk descriptor */
+    struct zio_tier_data_chunk_descriptor *data_descriptor = src_data;
+
+    struct tier_zio_impl *zio_tier = data_descriptor->zio_tier;
+
+    abd_t *abd_buf = abd_get_from_buf(buf, data_descriptor->length); 
+    int child_status;   
+
+    
+
+    /* Create the root zio */
+    zio_t *zio = zio_root(zio_tier->vdev->vdev_spa, NULL, NULL, 0);
+
+    zio_nowait(
+        zio_vdev_child_io(zio, 
+                          NULL,
+                          zio_tier->vdev,
+                          data_descriptor->offset,
+                          abd_buf,
+                          data_descriptor->length,
+                          ZIO_TYPE_READ,
+                          ZIO_PRIORITY_ASYNC_READ,
+                          0,
+                          _zio_tier_migration_read_done,
+                          &child_status));
+
+    /* Wait on the operation to complete */
+    int rc = zio_wait(zio) | child_status;
+
+    *offset = data_descriptor->logical_offset;
+    *length = data_descriptor->length;
+
+
+    return rc;
+}
+
+static void 
+zio_tier_migration_done(void *src_data, int status) {
+
+    /* Cast the source data to the data_chunk descriptor */
+    struct zio_tier_data_chunk_descriptor *data_chunk_descriptor = 
+        src_data;
+    struct tier_zio_impl *zio_tier = data_chunk_descriptor->zio_tier;
+
+    /* TODO if status is not 0, then we need to reissue again */
+    ASSERT(status == 0);
+
+
+    mutex_enter(&zio_tier->cache_lock);
+
+     /* Not migrating any more */
+    data_chunk_descriptor->status &= ~ZIO_TIER_CACHE_ENTRY_MIGRATING;
+
+    /* Not dirty anymore */
+    if(status == 0) {
+        data_chunk_descriptor->status &= ~ZIO_TIER_CACHE_ENTRY_DIRTY;
+        data_chunk_descriptor->status |= ZIO_TIER_CACHE_ENTRY_MIGRATED;
+    }
+
+
+    cv_broadcast(&zio_tier->migrated_cv);
+    mutex_exit(&zio_tier->cache_lock);
+}
+
+struct tier_write_zio_cb_data {
+
+    struct zio_tier_data_chunk_descriptor *chunk_descriptor;
+    abd_t *abd_buf_to_free;
 };
 
+static void
+tier_write_zio_impl_done(zio_t *zio) {
+    
+    ASSERT(zio->io_error == 0);
 
+    struct tier_write_zio_cb_data *cb_data = zio->io_private;
+
+    ASSERT(cb_data != NULL);
+    
+    struct zio_tier_data_chunk_descriptor *data_chunk_descriptor = 
+                cb_data->chunk_descriptor;
+    struct tier_zio_impl *zio_tier = data_chunk_descriptor->zio_tier;
+
+    if(cb_data->abd_buf_to_free != NULL) {
+        abd_free(cb_data->abd_buf_to_free);
+    }
+
+    kmem_free(cb_data, sizeof(*cb_data));
+
+
+    /* Decrement the number syncing */
+    uint32_t num_syncing = atomic_dec_32_nv(&data_chunk_descriptor->num_syncing);
+
+    struct zio_tier_data_chunk_descriptor *migrate = NULL;
+
+    mutex_enter(&zio_tier->cache_lock);
+
+    /* Once this data has no more active syncs and we know that the transaction
+     * group is higher, we know there will no more writes to this data chunk so
+     * it is synced to disk for good */ 
+    if(num_syncing == 0 && zio_tier->latest_txg > data_chunk_descriptor->txg) {
+
+        data_chunk_descriptor->status |= ZIO_TIER_CACHE_ENTRY_SYNCED;
+    }
+
+    /* Find the earliest data chunk ready eligible for migration */
+    for(struct zio_tier_data_chunk_descriptor *prev=AVL_PREV(&zio_tier->cache_tree_by_txg_and_addr, data_chunk_descriptor);
+        prev != NULL && (prev->status & (ZIO_TIER_CACHE_ENTRY_MIGRATING|ZIO_TIER_CACHE_ENTRY_MIGRATED)) == 0;
+        prev = AVL_PREV(&zio_tier->cache_tree_by_txg_and_addr, data_chunk_descriptor)) {
+        migrate = prev;
+    }
+
+
+    /* Submit the data chunks for migration upto and including this one that 
+       are not part of the active transaction and have been synced to disk  */
+    for(struct zio_tier_data_chunk_descriptor *curr = migrate; 
+        curr != NULL && 
+        curr->txg < zio_tier->latest_txg && curr->num_syncing == 0 && 
+        curr->status & (ZIO_TIER_CACHE_ENTRY_SYNCED);
+        curr = AVL_NEXT(&zio_tier->cache_tree_by_txg_and_addr, curr)) {
+
+        submit_for_migration(zio_tier->tiering_map, 
+                             _zio_tier_migration_read,
+                             zio_tier_migration_done, 
+                             curr->cap_info);
+    }
+
+
+    mutex_exit(&zio_tier->cache_lock);
+}
+
+static int
+_zio_tier_get_or_allocate_data_cache_object(struct tier_zio_impl *zio_tier,
+                                            uint64_t txg, 
+                                            uint64_t logical_offset,
+                                            uint64_t size,
+                                            struct cap_info *cap_info,
+                                            uint64_t cap_info_length,
+                                            struct zio_tier_data_chunk_descriptor **data_chunk) {
+
+
+    avl_index_t where;
+    struct zio_tier_data_chunk_descriptor search_descriptor = {
+        .txg = txg,
+        .offset = logical_offset,
+        .length = size,
+    };
+
+
+    mutex_enter(&zio_tier->cache_lock);
+
+    zio_tier->latest_txg = txg;
+
+    *data_chunk = avl_find(&zio_tier->cache_tree_by_txg_and_addr, 
+                            &search_descriptor, &where);
+
+    /* First write to this area */
+    if(*data_chunk == NULL) {
+        *data_chunk = kmem_alloc(
+            sizeof(struct zio_tier_data_chunk_descriptor)+cap_info_length, 
+            KM_SLEEP);
+
+        (*data_chunk)->zio_tier = zio_tier;
+        (*data_chunk)->txg = txg;
+        (*data_chunk)->offset = logical_offset;
+        (*data_chunk)->logical_offset = logical_offset;
+        (*data_chunk)->length = size;
+        (*data_chunk)->num_syncing = 1;
+        (*data_chunk)->status = ZIO_TIER_CACHE_ENTRY_DIRTY;
+        
+        memcpy((*data_chunk)->cap_info, cap_info, cap_info_length);
+
+        avl_insert(&zio_tier->cache_tree_by_txg_and_addr, *data_chunk, where);
+        
+        avl_find(&zio_tier->cache_tree_by_addr, &search_descriptor, &where);
+        avl_insert(&zio_tier->cache_tree_by_addr, *data_chunk, where);
+
+    /* Found a previous entry for this transaction so just need to increment the 
+     * syncing count */
+    }else {
+        atomic_inc_32_nv(&(*data_chunk)->num_syncing);
+    }
+
+    /* Need a callback for when syncing is done */
+
+    
+    mutex_exit(&zio_tier->cache_lock);
+
+    return 0;
+}
+
+
+
+
+static int
+tier_write_zio_impl(tier_t *tier, void *buf, boolean_t is_abd_buf, uint64_t txg, 
+                    uint64_t offset, uint64_t size, zio_t *zio, void *cap_info, 
+                    uint64_t cap_info_length) {
+
+    /* TODO function not finished, waiting for implementation of  
+     * caching */
+    ASSERT(0 != 0);
+
+    struct tier_zio_impl *zio_tier = (struct tier_zio_impl *) tier;
+    zio_t *parent_zio;
+    blkptr_t *blkptr;
+    abd_t *abd_buf;
+    
+    struct tier_write_zio_cb_data *cb_data = 
+        kmem_alloc(sizeof(struct tier_write_zio_cb_data), KM_SLEEP);
+    
+
+    int rc = 0;
+
+    if(zio == NULL) {
+        parent_zio = zio_root(zio_tier->vdev->vdev_spa, NULL, NULL, 0);
+        blkptr = NULL;  /* TODO shouldn't need the orig blkptr, but need to test this */
+
+    } else {
+        parent_zio = zio;
+        blkptr = zio->io_bp;
+    }
+
+    /* Buf is abd_buf so just cast it for use */
+    if(is_abd_buf) {
+        abd_buf = (abd_t *)buf;
+        cb_data->abd_buf_to_free = NULL;
+
+    /* Buf is raw void * so create a abd wrapper for it */
+    }else {
+        abd_buf = abd_get_from_buf(buf, size);
+        cb_data->abd_buf_to_free = abd_buf;
+    }
+
+
+    /* Get the cache object for this write */
+    rc = _zio_tier_get_or_allocate_data_cache_object(zio_tier, txg, offset, size, 
+                                                     cap_info, cap_info_length, 
+                                                     &cb_data->chunk_descriptor);
+
+    ASSERT(rc == 0);
+
+    /* Lock the spa and create a parent zio that will unlock it on
+     * completion of the io operations */
+    spa_config_enter(zio_tier->vdev->vdev_spa, SCL_ALL, FTAG, RW_READER);
+
+    zio_nowait(zio_vdev_child_io(parent_zio,
+                                 blkptr,
+                                 zio_tier->vdev,
+                                 cb_data->chunk_descriptor->offset, /* Use the potential remapped offset */
+                                 abd_buf,
+                                 size,
+                                 ZIO_TYPE_WRITE,
+                                 ZIO_PRIORITY_ASYNC_WRITE,
+                                 0,
+                                 tier_write_zio_impl_done,
+                                 cb_data));
+
+    spa_config_exit(zio_tier->vdev->vdev_spa, SCL_ALL, FTAG);
+
+
+    return rc;
+}
+
+static tier_t *
+allocate_zio_tier(void) {
+
+    struct tier_zio_impl *tier = kmem_alloc(sizeof(struct tier_zio_impl), 
+                                            KM_SLEEP);
+
+    /* Set the instance methods */
+    tier->t.init = tier_init_zio_impl;
+    tier->t.fini = tier_fini_zio_impl;
+    tier->t.set_tiering_map = tier_set_tiering_map_zio_impl;
+    tier->t.allocate_space = tier_allocate_space_zio_impl;
+    tier->t.deallocate_space = NULL;
+    tier->t.write = tier_write_zio_impl;
+    tier->t.read = tier_read_zio_impl;
+    tier->t.evict = NULL;
+    tier->t.stats = NULL;
+
+    /* Set the private variables */
+    tier->tiering_map = NULL;
+
+    return (tier_t *)tier;
+}
+
+
+
+#if 0
 static data_range_t *
 data_range_create(tiering_map_t *tiering_map, uint64_t cap_offset,
                   uint64_t cap_size, uint64_t perf_offset,
@@ -698,10 +2238,10 @@ data_range_create(tiering_map_t *tiering_map, uint64_t cap_offset,
     BP_ZERO(&data_range->curr_blkptr);
     BP_ZERO(&data_range->dest_blkptr);
 
-    /* TODO need to rewrite code to avoid needing the struct spa_tier instead
+    /* TODO need to rewrite code to avoid needing the struct dmu_tier instead
      * of tier_t */
-    struct spa_tier *spa_tier = (struct spa_tier *)tiering_map->perf_tier;
-    data_range->num_evict_rounds = spa_tier->num_evict_rounds;
+    struct dmu_tier *dmu_tier = (struct dmu_tier *)tiering_map->perf_tier;
+    data_range->num_evict_rounds = dmu_tier->num_evict_rounds;
 
     /* Increment the reference count */
     zfs_refcount_create(&data_range->refcount);
@@ -709,8 +2249,10 @@ data_range_create(tiering_map_t *tiering_map, uint64_t cap_offset,
 
     return data_range;
 }
+#endif
 
 
+#if 0
 static void
 data_range_destroy(data_range_t *data_range) __attribute__((unused));
 static void
@@ -724,6 +2266,9 @@ data_range_destroy(data_range_t *data_range) {
     kmem_free(data_range, sizeof(data_range_t));
 }
 
+#endif
+
+#if 0
 static void
 data_range_reference_change(
     struct perf_tier_alloc_tracker *perf_tier_alloc_tracker) {
@@ -735,7 +2280,9 @@ data_range_reference_change(
 
     mutex_exit(&perf_tier_alloc_tracker->perf_tier_allocs_lock);
 }
+#endif
 
+#if 0
 static int
 address_compare(const void *v1, const void *v2) {
 
@@ -772,6 +2319,7 @@ address_compare(const void *v1, const void *v2) {
 
     return 0;
 }
+#endif
 
 #if 0
 static void
@@ -860,6 +2408,7 @@ static void zio_test(spa_t *spa) {
 }
 #endif
 
+#if 0
 static struct perf_tier_alloc_tracker *
 allocate_perf_tier_alloc_tracker(tier_t *tier) {
 
@@ -985,8 +2534,9 @@ allocate_perf_tier_alloc_tracker(tier_t *tier) {
 //
 //    return NULL;
 }
+#endif
 
-
+#if 0
 static void
 free_performance_tier_alloc_tracker(struct perf_tier_alloc_tracker *perf_tier_alloc_tracker) {
 
@@ -1027,7 +2577,7 @@ free_performance_tier_alloc_tracker(struct perf_tier_alloc_tracker *perf_tier_al
               sizeof(struct perf_tier_alloc_tracker));
 
 }
-
+#endif
 
 //static struct bucket *
 //performance_tier_alloc_tracker_find_bucket(
@@ -1057,12 +2607,13 @@ evict_done(zio_t *zio) {
 }
 #endif
 
+#if 0
 static void
 performance_tier_alloc_tracker_evict_blocks(
         struct perf_tier_alloc_tracker *perf_tier_alloc_tracker,
         tier_t *tier,
         uint64_t size,
-        //uint64_t curr_txg,
+        //uint64_t curr_cache_id,
         uint64_t *last_evict_round) {
 
     ASSERT(size <= PERF_TIER_ALLOC_TRACKER_RECORD_SIZE);
@@ -1072,9 +2623,9 @@ performance_tier_alloc_tracker_evict_blocks(
     // zio_t *root_zio = NULL;
     uint64_t ndata_range_changes;
 
-    /* TODO need to rewrite code to avoid needing the struct spa_tier instead
+    /* TODO need to rewrite code to avoid needing the struct dmu_tier instead
      * of tier_t */
-    struct spa_tier *spa_tier = (struct spa_tier *)tier;
+    struct dmu_tier *dmu_tier = (struct dmu_tier *)tier;
 
     mutex_enter(&perf_tier_alloc_tracker->perf_tier_allocs_lock);
 
@@ -1086,7 +2637,7 @@ performance_tier_alloc_tracker_evict_blocks(
 //    objset_t *os = pool->dp_meta_objset;
 
     /* Wait until there is free space */
-    while(*last_evict_round == spa_tier->num_evict_rounds &&
+    while(*last_evict_round == dmu_tier->num_evict_rounds &&
           nevicts == 0 &&
           size > amt_freed) {
 
@@ -1219,7 +2770,7 @@ performance_tier_alloc_tracker_evict_blocks(
             //     zio_execute(root_zio);
             // }
 
-            spa_tier->num_evict_rounds++;
+            dmu_tier->num_evict_rounds++;
 
             zfs_dbgmsg("Broadcasting");
 
@@ -1227,7 +2778,7 @@ performance_tier_alloc_tracker_evict_blocks(
         }
     }
 
-    *last_evict_round = spa_tier->num_evict_rounds;
+    *last_evict_round = dmu_tier->num_evict_rounds;
 
 //    spa_tier->spa->spa_dsl_pool->dp_tx.tx_sync_thread = curthread;
     //spa_sync(spa_tier->spa, spa_syncing_txg(spa_tier->spa));
@@ -1251,6 +2802,7 @@ performance_tier_alloc_tracker_evict_blocks(
     //vdev_sync(spa_tier->spa->spa_root_vdev, spa_syncing_txg(spa_tier ->spa));
     mutex_exit(&perf_tier_alloc_tracker->perf_tier_allocs_lock);
 }
+#endif
 
 #if 0
 static void
@@ -1288,7 +2840,7 @@ vdev_tiering_performance_read_migration_child_done(zio_t *zio) {
 #endif
 
 
-
+#if 0
 static void
 vdev_tiering_performance_write_migration_child_done(zio_t *zio) {
 
@@ -1327,6 +2879,7 @@ vdev_tiering_performance_write_migration_child_done(zio_t *zio) {
 
     
 }
+#endif
 
 
 //
@@ -1347,27 +2900,32 @@ vdev_tiering_performance_write_migration_child_done(zio_t *zio) {
 //}
 
 static int
-migration_issue_reads(tiering_map_t *tiering_map, list_t *list) {
+migration_issue_reads(tiering_map_t *tiering_map, list_t *list, void *buffer) {
 
     /* TODO should pass tier directly */
-    tier_t *tier = tiering_map->perf_tier;
+    // tier_t *tier = tiering_map->perf_tier;
    
 
     /* Create the parent zio */
-    zio_t *parent_zio = zio_root(tiering_map->capacity_vdev->vdev_spa,
-                                 NULL, NULL, 0);
+    // zio_t *parent_zio = zio_root(tiering_map->capacity_vdev->vdev_spa,
+    //                              NULL, NULL, 0);
     
+    // static void *buf = NULL;
+
+    // if(buf == NULL) {
+    //     buf = kmem_alloc(131072, KM_SLEEP);
+    // }
 
     /* Process the data ranges that need to be migration */
-    for(data_range_t *data_range = list_remove_tail(list);
-        data_range != NULL;
-        data_range = list_remove_tail(list)) {
+    for(struct migration_request *migration_request = list_remove_tail(list);
+        migration_request != NULL;
+        migration_request = list_remove_tail(list)) {
 
-        zfs_refcount_transfer_ownership(&data_range->refcount, list, FTAG);
+        // zfs_refcount_transfer_ownership(&data_range->refcount, list, FTAG);
 
         /* TODO improve the allocation of data buffers */
         /* Create the data buffer */
-        /*data_range->databuf*/ abd_t *buf = abd_alloc_linear(data_range->cap_size, B_FALSE);
+        /*data_range->databuf*/ //abd_t *buf = abd_alloc_linear(data_range->cap_size, B_FALSE);
 
         
         /* Read in the data from the performance tier */
@@ -1398,41 +2956,101 @@ migration_issue_reads(tiering_map_t *tiering_map, list_t *list) {
         // zio_nowait(zio);
 
 
-        ASSERT(zfs_refcount_count(&data_range->refcount) > 1);
-        ASSERT(data_range->perf_size == data_range->cap_size);
+        // ASSERT(zfs_refcount_count(&data_range->refcount) > 1);
+        // ASSERT(data_range->perf_size == data_range->cap_size);
         
-        int rc = tier->read(tier, /*data_range->databuf*/abd_to_buf(buf), 
-                            data_range->perf_offset, 
-                            data_range->perf_size);
+        // uint64_t txg = 0;
 
-        /* TODO handle error */
-        ASSERT(rc == 0);
+        /* TODO need to set txg to the correct value */
+        // ASSERT(txg != 0);
+
+        // int rc = tier->read(tier, /*data_range->databuf*/abd_to_buf(buf), 
+        //                     txg,
+        //                     data_range->perf_offset, 
+        //                     data_range->perf_size);
+
+        
+        uint64_t offset = 0;
+        uint64_t length = 0;
+        void *cap_data = NULL;
+        int migration_status = 0;
+
+        zfs_dbgmsg("Transfer starting");
+
+        for(int rc=0; rc == 0; ) {
+            rc = migration_request->src_read_func(migration_request->src_data, 
+                                                  buffer, &offset, &length,
+                                                  &cap_data);
+
+
+            zfs_dbgmsg("Read chunk is %d:%d rc = %d", offset, length, rc);
 
     
-        zio_t *zio = zio_vdev_child_io(
-                                parent_zio,
-                                &data_range->dest_blkptr,
-                                tiering_map->capacity_vdev,
-                                data_range->cap_offset,
-                                buf,
-                                data_range->cap_size,
-                                ZIO_TYPE_WRITE,
-                                ZIO_PRIORITY_ASYNC_WRITE,
-                                0,
-                                vdev_tiering_performance_write_migration_child_done,
-                                data_range);
+            switch(rc) {
+
+                /* Success */
+                case 0:
+                    rc = migration_request->dest_write_func(
+                            migration_request->dst_data, buffer, offset, length,
+                            cap_data);
+
+                    ASSERT(rc == 0);
+
+                    break;
+
+                /* No more data to be transferred */
+                case ENOENT:
+                    break;
+
+                /* Error has occurred */
+                default:
+                    ASSERT(rc == 0);
+                    migration_status = rc;
+                    break;
+            }
+        }
+
+    
+        /* TODO implement done callback  */
+        migration_request->src_done_func(migration_request->src_data, 
+                                         migration_status);
 
 
-        zfs_refcount_transfer_ownership(&data_range->refcount, FTAG, zio);
+        kmem_free(migration_request, sizeof(*migration_request));
 
-        zio_nowait(zio);
 
-        ASSERT(zfs_refcount_count(&data_range->refcount) > 1);
+
+        /* TODO handle error */
+        //ASSERT(rc == 0);
+
+
+        // zio_t *zio = zio_vdev_child_io(
+        //                         parent_zio,
+        //                         &data_range->dest_blkptr,
+        //                         tiering_map->capacity_vdev,
+        //                         data_range->cap_offset,
+        //                         buf,
+        //                         data_range->cap_size,
+        //                         ZIO_TYPE_WRITE,
+        //                         ZIO_PRIORITY_ASYNC_WRITE,
+        //                         0,
+        //                         vdev_tiering_performance_write_migration_child_done,
+        //                         data_range);
+
+        
+
+        
+
+        //zfs_refcount_transfer_ownership(&data_range->refcount, FTAG, zio);
+
+        // zio_nowait(zio);
+
+        // ASSERT(zfs_refcount_count(&data_range->refcount) > 1);
     }
 
 
     /* Wait on the transfers to complete */
-    zio_wait(parent_zio);
+    // zio_wait(parent_zio);
 
     return 0;
 }
@@ -1476,22 +3094,27 @@ migration_issue_reads(tiering_map_t *tiering_map, list_t *list) {
 // }
 
 #define migration_thread_sleep_interval 20
-#define MAX_BUFS_PER_ROUND 2
+#define MAX_BUFS_PER_ROUND 1
+#define MAX_BUF_SIZE 131072
 
 static void migration_thread(void *arg) {
 
     tiering_map_t *tiering_map = arg;
-    list_t from_performance_tier_data_ranges;
-    list_t to_capacity_tier_data_ranges;
+    list_t active_migration_queue;
+    void *buffer;
+    //list_t to_capacity_tier_data_ranges;
     //zio_t *parent_zio = NULL;
 
-
     /* Create a working list for data ranges being processed */
-    list_create(&from_performance_tier_data_ranges, sizeof(data_range_t),
-                offsetof(data_range_t, migration_queue_node));
+    list_create(&active_migration_queue, sizeof(struct migration_request),
+                offsetof(struct migration_request, link));
 
-    list_create(&to_capacity_tier_data_ranges, sizeof(data_range_t),
-                offsetof(data_range_t, migration_queue_node));
+    buffer = vmem_alloc(MAX_BUF_SIZE, KM_SLEEP);
+
+    ASSERT(buffer != NULL);
+
+    // list_create(&to_capacity_tier_data_ranges, sizeof(data_range_t),
+    //             offsetof(data_range_t, migration_queue_node));
 
     /* TODO remove print statement */
     vdev_dbgmsg(tiering_map->tiering_vdev, "migration_thread is running");
@@ -1501,8 +3124,8 @@ static void migration_thread(void *arg) {
     while(tiering_map->tiering_thread_exit == 0) {
 
         while(/*tiering_map->num_of_free_bufs != MAX_BUFS_PER_ROUND &&*/
-              list_is_empty(&tiering_map->from_performance_tier_data_ranges) &&
-              list_is_empty(&tiering_map->to_capacity_tier_data_ranges) &&
+              list_is_empty(&tiering_map->migration_queue) == B_TRUE /*&&
+              list_is_empty(&tiering_map->to_capacity_tier_data_ranges)*/ &&
               tiering_map->tiering_thread_exit == 0) {
 
             cv_timedwait(&(tiering_map->tiering_migration_thr_cv),
@@ -1512,31 +3135,30 @@ static void migration_thread(void *arg) {
         }
 
         /* TODO test code */
-//        mutex_exit(&(tiering_map->tiering_migration_thr_lock));
-//        delay(SEC_TO_TICK(10));
-//        mutex_enter(&(tiering_map->tiering_migration_thr_lock));
+    //    mutex_exit(&(tiering_map->tiering_migration_thr_lock));
+    //    delay(SEC_TO_TICK(10));
+    //    mutex_enter(&(tiering_map->tiering_migration_thr_lock));
 
         zfs_dbgmsg("migration_thread is awake");
         
 
         /* There are data ranges on the performance tier to be migrated, move
          * them to a non-contended list */
-        while(tiering_map->num_of_free_bufs > 0 &&
-              list_is_empty(&tiering_map->from_performance_tier_data_ranges) == B_FALSE) {
+        while(/*tiering_map->num_of_free_bufs > 0 &&*/
+              list_is_empty(&tiering_map->migration_queue) == B_FALSE) {
 
-            data_range_t *data_range = list_remove_tail(
-                    &tiering_map->from_performance_tier_data_ranges);
+            struct migration_request *migration_request = 
+                list_remove_tail(&tiering_map->migration_queue);
 
-            list_insert_head(&from_performance_tier_data_ranges,
-                             data_range);
+            list_insert_head(&active_migration_queue, migration_request);
 
-            zfs_refcount_transfer_ownership(&data_range->refcount,
-                                            &tiering_map->from_performance_tier_data_ranges,
-                                            &from_performance_tier_data_ranges);
+            // zfs_refcount_transfer_ownership(&data_range->refcount,
+            //                                 &tiering_map->from_performance_tier_data_ranges,
+            //                                 &from_performance_tier_data_ranges);
 
             tiering_map->num_of_free_bufs--;
 
-            ASSERT(zfs_refcount_count(&data_range->refcount) > 1);
+            // ASSERT(zfs_refcount_count(&data_range->refcount) > 1);
         }
 
 
@@ -1560,16 +3182,12 @@ static void migration_thread(void *arg) {
         mutex_exit(&(tiering_map->tiering_migration_thr_lock));
 
 
-        /* Lock the spa and create a parent zio that will unlock it on
-         * completion of the io operations */
-        //spa_config_enter(tiering_map->performance_vdev->vdev_spa, SCL_ALL, FTAG, RW_READER);
-        spa_config_enter(tiering_map->capacity_vdev->vdev_spa, SCL_ALL, FTAG, RW_READER);
+        
 
-
-        if(list_is_empty(&from_performance_tier_data_ranges) == B_FALSE) {
+        if(list_is_empty(&active_migration_queue) == B_FALSE) {
 
             int rc = migration_issue_reads(tiering_map,
-                                           &from_performance_tier_data_ranges);
+                                           &active_migration_queue, buffer);
         
             /* TODO handle error */
             ASSERT(rc == 0);
@@ -1588,7 +3206,7 @@ static void migration_thread(void *arg) {
         //delay(SEC_TO_TICK(10));
 
         //spa_config_exit(tiering_map->performance_vdev->vdev_spa, SCL_ALL, FTAG);
-        spa_config_exit(tiering_map->capacity_vdev->vdev_spa, SCL_ALL, FTAG);
+        
 
         /* TODO need to know when to free the parent and children zios */
         // parent_zio = NULL;
@@ -1613,9 +3231,10 @@ static void migration_thread(void *arg) {
     mutex_exit(&(tiering_map->tiering_migration_thr_lock));
 
     /* Destroy the working lists */
-    list_destroy(&from_performance_tier_data_ranges);
-    list_destroy(&to_capacity_tier_data_ranges);
+    list_destroy(&active_migration_queue);
+    //list_destroy(&to_capacity_tier_data_ranges);
 
+    kmem_free(buffer, MAX_BUF_SIZE);
 
     zfs_dbgmsg("migration_thread is stopped");
 
@@ -1623,6 +3242,7 @@ static void migration_thread(void *arg) {
 }
 
 
+#if 0
 static data_range_t *
 performance_tier_alloc_tracker_find_mapping(struct perf_tier_alloc_tracker *perf_tier_alloc_tracker,
         blkptr_t *bp, uint64_t io_offset, uint64_t io_size) {
@@ -1671,8 +3291,9 @@ performance_tier_alloc_tracker_find_mapping(struct perf_tier_alloc_tracker *perf
 
     return data_range;
 }
+#endif
 
-
+#if 0
 static void
 performance_tier_alloc_tracker_add_mapping(struct perf_tier_alloc_tracker *perf_tier_alloc_tracker,
                                            data_range_t *data_range)
@@ -1722,20 +3343,21 @@ performance_tier_alloc_tracker_add_mapping(struct perf_tier_alloc_tracker *perf_
     rw_exit(&perf_tier_alloc_tracker->lock);
 }
 
-
+#endif
 
 
 static tiering_map_t *
-vdev_tiering_map_init(vdev_t *my_vdev, tier_t *perf_tier, vdev_t *slow_tier) {
+vdev_tiering_map_init(vdev_t *my_vdev, tier_t *cap_tier, tier_t *perf_tier, 
+                      vdev_t *slow_tier) {
 
     /* Allocate and initialize the perf tier allocation tracker */
-    struct perf_tier_alloc_tracker *perf_tier_alloc_tracker =
-            allocate_perf_tier_alloc_tracker(perf_tier);
+    // struct perf_tier_alloc_tracker *perf_tier_alloc_tracker =
+    //         allocate_perf_tier_alloc_tracker(perf_tier);
 
-    /* Error so return */
-    if(perf_tier_alloc_tracker == NULL) {
-        return NULL;
-    }
+    // /* Error so return */
+    // if(perf_tier_alloc_tracker == NULL) {
+    //     return NULL;
+    // }
 
 
     /* Allocate the central main data structure for the tiering vdev instance */
@@ -1745,14 +3367,15 @@ vdev_tiering_map_init(vdev_t *my_vdev, tier_t *perf_tier, vdev_t *slow_tier) {
      * available but just in case */
     if(tiering_map != NULL) {
         tiering_map->tiering_vdev = my_vdev;
+        tiering_map->cap_tier  = cap_tier;
         tiering_map->perf_tier = perf_tier;
-        tiering_map->capacity_vdev = slow_tier;
+        //tiering_map->capacity_vdev = slow_tier;
         tiering_map->num_of_free_bufs = MAX_BUFS_PER_ROUND;
 
-        list_create(&tiering_map->from_performance_tier_data_ranges, sizeof(data_range_t),
-                    offsetof(data_range_t, migration_queue_node));
-        list_create(&tiering_map->to_capacity_tier_data_ranges, sizeof(data_range_t),
-                    offsetof(data_range_t, migration_queue_node));
+        list_create(&tiering_map->migration_queue, sizeof(struct migration_request),
+                    offsetof(struct migration_request, link));
+        // list_create(&tiering_map->to_capacity_tier_data_ranges, sizeof(data_range_t),
+        //             offsetof(data_range_t, migration_queue_node));
 
         mutex_init(&tiering_map->tiering_migration_thr_lock, NULL,
                    MUTEX_DEFAULT, NULL);
@@ -1768,10 +3391,13 @@ vdev_tiering_map_init(vdev_t *my_vdev, tier_t *perf_tier, vdev_t *slow_tier) {
                                                     TS_RUN,
                                                     minclsyspri);
 
-        tiering_map->perf_tier_alloc_tracker = perf_tier_alloc_tracker;
+        //tiering_map->perf_tier_alloc_tracker = perf_tier_alloc_tracker;
+
+        tiering_map->cap_tier->set_tiering_map(cap_tier, tiering_map);
+        tiering_map->perf_tier->set_tiering_map(perf_tier, tiering_map);
 
     } else {
-        free_performance_tier_alloc_tracker(perf_tier_alloc_tracker);
+        //free_performance_tier_alloc_tracker(perf_tier_alloc_tracker);
     }
 
     return tiering_map;
@@ -1783,13 +3409,13 @@ static void
 vdev_tiering_map_free(tiering_map_t *tiering_map) {
 
 
-    free_performance_tier_alloc_tracker(tiering_map->perf_tier_alloc_tracker);
+    // free_performance_tier_alloc_tracker(tiering_map->perf_tier_alloc_tracker);
 
     mutex_destroy(&(tiering_map->tiering_migration_thr_lock));
     cv_destroy(&(tiering_map->tiering_migration_thr_cv));
 
-    list_destroy(&tiering_map->from_performance_tier_data_ranges);
-    list_destroy(&tiering_map->to_capacity_tier_data_ranges);
+    list_destroy(&tiering_map->migration_queue);
+    //list_destroy(&tiering_map->to_capacity_tier_data_ranges);
 
 
     kmem_free(tiering_map, sizeof(tiering_map_t));
@@ -1803,7 +3429,8 @@ vdev_tiering_open(vdev_t *vd, uint64_t *asize, uint64_t *max_asize,
 {
     tiering_map_t *tiering_map = NULL;
     tier_t *perf_tier = NULL;
-   
+    tier_t *cap_tier = NULL;
+    int rc = 0;
 
     /* TODO remove print statement */
     zfs_dbgmsg("Inside of vdev_tiering_open");
@@ -1867,13 +3494,13 @@ vdev_tiering_open(vdev_t *vd, uint64_t *asize, uint64_t *max_asize,
 
         /* TODO Need to transfer ownership of objset from FTAG to perf_tier */
         /* Create the performance tier */
-        perf_tier = allocate_spa_tier();
+        perf_tier = allocate_dmu_tier();
         
         ASSERT(perf_tier != NULL);
 
         /* Initialize the performance tier */
-        int rc = perf_tier->init(perf_tier, name);
-
+        rc = perf_tier->init(perf_tier, name, 
+                TIER_VIRTUAL_ADDR_CAP|TIER_EVICT_CAP|TIER_MIGRATION_CAP);
 
         if(rc != 0) {
             zfs_dbgmsg("Error opening dataset %s at %s@%d", name, __FUNCTION__, __LINE__);
@@ -1882,7 +3509,18 @@ vdev_tiering_open(vdev_t *vd, uint64_t *asize, uint64_t *max_asize,
     }
 
 
+    
+    cap_tier = allocate_zio_tier();
 
+    ASSERT(cap_tier != NULL);
+
+    /* Initialize the capacity tier */
+    rc = cap_tier->init(cap_tier, vd->vdev_child[0], TIER_DEST_CAP);
+
+    if(rc != 0) {
+        zfs_dbgmsg("Error opening capacity tier at %s@%d", __FUNCTION__, __LINE__);
+        return (SET_ERROR(rc));
+    }
 
     // for(int i=0; i<1; i++) {
 
@@ -1926,6 +3564,7 @@ vdev_tiering_open(vdev_t *vd, uint64_t *asize, uint64_t *max_asize,
 
     /* Create an initialize tiering map */
     tiering_map = vdev_tiering_map_init(vd,
+                                        cap_tier,
                                         perf_tier,
                                         vd->vdev_child[0]);
 
@@ -1991,11 +3630,20 @@ vdev_tiering_close(vdev_t *vd)
 }
 
 
-
+#if 0
 static void
 vdev_tiering_capacity_allocate_child_done(zio_t *zio) {
 
     ASSERT(zio->io_error == 0);
+
+    struct cap_info *cap_info = zio->io_private;
+
+    cap_info->dest_blkptr = *zio->io_bp;
+
+    ASSERT(memcmp(&cap_info->orig_blkptr, &cap_info->dest_blkptr, sizeof(blkptr_t)) == 0);
+
+    kmem_free(cap_info, sizeof(*cap_info));
+
 
     /* Get access to the data range entry and transfer ownership to this function */
     data_range_t *data_range = zio->io_private;
@@ -2043,19 +3691,22 @@ vdev_tiering_capacity_allocate_child_done(zio_t *zio) {
 
     /* Execute zio */
     //zio_execute(data_range->orig_zio);
+
 }
+#endif
+
+// /* TODO this is only temporary until we have better flow control in the
+//  * write op */
+// struct write_op_data {
+//     kmutex_t lock;
+//     kcondvar_t cv;
+//     //data_range_t *data_range;
+//     u_int64_t txg;
+//     void *buf;
+// };
 
 
-/* TODO this is only temporary until we have better flow control in the
- * write op */
-struct write_op_data {
-    kmutex_t lock;
-    kcondvar_t cv;
-    data_range_t *data_range;
-    void *buf;
-};
-
-
+#if 0
 static void
 vdev_tiering_performance_write_child_done(void *data, int error) {
 
@@ -2177,10 +3828,11 @@ vdev_tiering_performance_write_child_done(void *data, int error) {
             int rc = tiering_map->perf_tier->write(
                             tiering_map->perf_tier,
                             write_op_data->buf,
+                            write_op_data->txg,
                             write_op_data->data_range->perf_offset,
-                            write_op_data->data_range->perf_size,
+                            write_op_data->data_range->perf_size/*,
                             vdev_tiering_performance_write_child_done,
-                            write_op_data);
+                            write_op_data*/);
 
             
             ASSERT(rc == 0);
@@ -2217,6 +3869,7 @@ vdev_tiering_performance_write_child_done(void *data, int error) {
     }
 }
 
+#endif
 
 // static void
 // vdev_tiering_performance_read_child_done(zio_t *zio) {
@@ -2240,19 +3893,26 @@ vdev_tiering_performance_write_child_done(void *data, int error) {
 
 
 
-
+#if 0
 static void
 vdev_tiering_capacity_read_child_done(zio_t *zio) {
-    vdev_dbgmsg(zio->io_vd, "Inside of %s io_error = %d", __FUNCTION__, zio->io_error);
+    
+    if(zio->io_error != 0) {
+        vdev_dbgmsg(zio->io_vd, "Read error at offset %llu length: %llu written at %llu buffer is linear %d",
+           zio->io_offset-(4*1024*1024), zio->io_size, zio->io_txg, abd_is_linear(zio->io_abd));
+    }
 
     ASSERT(zio->io_error == 0);
 }
+#endif
 
-
-struct abd_iter_tier_read_func_priv {
+#if 0
+struct tier_read_dmu_impl_iter_read_func_priv {
     tier_t *tier;
+    u_int64_t txg;
     u_int64_t offset;
 };
+
 
 static int
 abd_iter_tier_read_func(void *buf, size_t len, void *priv) {
@@ -2261,6 +3921,7 @@ abd_iter_tier_read_func(void *buf, size_t len, void *priv) {
 
     int rc = read_data->tier->read(read_data->tier,
                                    buf,
+                                   read_data->txg,
                                    read_data->offset,
                                    len);
     if(rc == 0) {
@@ -2272,6 +3933,8 @@ abd_iter_tier_read_func(void *buf, size_t len, void *priv) {
     return rc;
 }
 
+#endif
+
 static void
 vdev_tiering_io_start(zio_t *zio) {
 
@@ -2279,7 +3942,7 @@ vdev_tiering_io_start(zio_t *zio) {
     tiering_map_t *tiering_map = zio->io_vd->vdev_tsd;
 //    kmutex_t *lock = &tiering_map->tiering_migration_thr_lock;
     //vdev_t *vd;
-    data_range_t *data_range = NULL;
+    // data_range_t *data_range = NULL;
 
     /* TODO remove print statement */
     vdev_dbgmsg(zio->io_vd, "Inside of vdev_tiering_io_start, tiering_map = %p", tiering_map);
@@ -2291,23 +3954,23 @@ vdev_tiering_io_start(zio_t *zio) {
         /* TODO Implement read op */
         case ZIO_TYPE_READ: {
             vdev_dbgmsg(zio->io_vd,
-                        "vdev_tiering_io_start read op offset: %llu length %llu",
-                        zio->io_offset, zio->io_size);
+                        "vdev_tiering_io_start read op txg = %llu offset: %llu length %llu",
+                        zio->io_txg, zio->io_offset, zio->io_size);
 
 
-            data_range = performance_tier_alloc_tracker_find_mapping(
-                    tiering_map->perf_tier_alloc_tracker,
-                    zio->io_bp,
-                    zio->io_offset,
-                    zio->io_size);
+            // data_range = performance_tier_alloc_tracker_find_mapping(
+            //         tiering_map->perf_tier_alloc_tracker,
+            //         zio->io_bp,
+            //         zio->io_offset,
+            //         zio->io_size);
 
 
             /* On the performance tier */
-            if(data_range != NULL) {
+            // if(data_range != NULL) {
 
-                zfs_refcount_transfer_ownership(&data_range->refcount,
-                                    performance_tier_alloc_tracker_find_mapping,
-                                    FTAG);
+                // zfs_refcount_transfer_ownership(&data_range->refcount,
+                //                     performance_tier_alloc_tracker_find_mapping,
+                //                     FTAG);
 
 //                spa_t *perf_spa = tiering_map->performance_vdev->vdev_spa;
 //
@@ -2336,40 +3999,53 @@ vdev_tiering_io_start(zio_t *zio) {
 
                 int rc = 0;
 
-                /* Linear buffer so just get a reference to the raw buffer */
-                if(abd_is_linear(zio->io_abd)) {
+                // /* Linear buffer so just get a reference to the raw buffer */
+                // if(abd_is_linear(zio->io_abd)) {
                 
-                    rc = tiering_map->perf_tier->read(
+                //     rc = tiering_map->perf_tier->read(
+                //                             tiering_map->perf_tier,
+                //                             abd_to_buf(zio->io_abd),
+                //                             zio->io_txg,
+                //                             zio->io_offset,
+                //                             zio->io_size);
+
+                // /* Scattered buffer so need to iterate over buffers calling
+                //    the read function */
+                // } else {
+
+                //     struct abd_iter_tier_read_func_priv priv = {
+                //         .tier   = tiering_map->perf_tier,
+                //         .txg    = zio->io_txg,
+                //         .offset = zio->io_offset
+                //         };
+
+                //     rc = abd_iterate_func(zio->io_abd, 0, zio->io_size,  
+                //                 abd_iter_tier_read_func, &priv);
+                // }
+
+
+                rc = tiering_map->perf_tier->read(
                                             tiering_map->perf_tier,
-                                            abd_to_buf(zio->io_abd),
-                                            data_range->perf_offset,
-                                            data_range->perf_size);
+                                            zio->io_abd,
+                                            B_TRUE,
+                                            zio->io_txg,
+                                            zio->io_offset,
+                                            zio->io_size,
+                                            zio);
 
-                /* Scattered buffer so need to iterate over buffers calling
-                   the read function */
-                } else {
-
-                    struct abd_iter_tier_read_func_priv priv = {
-                        .tier   = tiering_map->perf_tier,
-                        .offset = data_range->perf_offset
-                        };
-
-                    rc = abd_iterate_func(zio->io_abd, 0, data_range->perf_size,  
-                                abd_iter_tier_read_func, &priv);
-                }
-
-
-
-                if(rc != 0) {
-                    vdev_dbgmsg(zio->io_vd,
-                        "Error in vdev_tiering_io_start read op offset: %llu length %llu rc = %d",
-                        zio->io_offset, zio->io_size, rc);
-
+                if(rc == 0) {
                     zio->io_error = rc;
+                    vdev_dbgmsg(zio->io_vd,
+                        "vdev_tiering_io_start read op on perf tier success offset: %llu length %llu rc = %d, trying capacity tier",
+                        zio->io_offset, zio->io_size, rc);
                     goto READ_DONE;
                 } else {
-                    zio->io_error = 0;
+                    vdev_dbgmsg(zio->io_vd,
+                        "vdev_tiering_io_start read op  on perf tier error offset: %llu length %llu rc = %d, trying capacity tier",
+                        zio->io_offset, zio->io_size, rc);
                 }
+                    
+                
 
                 //zfs_refcount_add(&data_range->refcount, perf_read);
 
@@ -2389,32 +4065,42 @@ vdev_tiering_io_start(zio_t *zio) {
                 // zio_nowait(nop_zio);
 
                 /* Remove the local reference to the data range */
-                ASSERT(zfs_refcount_count(&data_range->refcount) > 1);
+                // ASSERT(zfs_refcount_count(&data_range->refcount) > 1);
                 
-                struct perf_tier_alloc_tracker *perf_tier_alloc_tracker = 
-                        data_range->perf_tier_alloc_tracker;
-                zfs_refcount_remove(&data_range->refcount, FTAG);
+                // struct perf_tier_alloc_tracker *perf_tier_alloc_tracker = 
+                //         data_range->perf_tier_alloc_tracker;
+                // zfs_refcount_remove(&data_range->refcount, FTAG);
 
-                data_range_reference_change(perf_tier_alloc_tracker);
+                // data_range_reference_change(perf_tier_alloc_tracker);
 
             /* On the capacity tier */
-            } else {
+            
+            vdev_dbgmsg(zio->io_vd,
+                        "vdev_tiering_io_start read op on capacity tier offset: %llu length %llu",
+                        zio->io_offset, zio->io_size);
 
-                /* Schedule a read on the capacity tier */
-                zio_nowait(
-                        zio_vdev_child_io(zio,
-                                          zio->io_bp,
-                                          tiering_map->capacity_vdev,
-                                          zio->io_offset,
-                                          zio->io_abd,
-                                          zio->io_size,
-                                          zio->io_type,
-                                          zio->io_priority,
-                                          0,
-                                          vdev_tiering_capacity_read_child_done,
-                                          tiering_map));
+            /* Schedule a read on the capacity tier */
+            rc = tiering_map->cap_tier->read(tiering_map->cap_tier, 
+                                             zio->io_abd,
+                                             B_TRUE, 
+                                             zio->io_txg, 
+                                             zio->io_offset, 
+                                             zio->io_size, 
+                                             zio);
+            // zio_nowait(
+            //         zio_vdev_child_io(zio,
+            //                             zio->io_bp,
+            //                             tiering_map->capacity_vdev,
+            //                             zio->io_offset,
+            //                             zio->io_abd,
+            //                             zio->io_size,
+            //                             zio->io_type,
+            //                             zio->io_priority,
+            //                             0,
+            //                             vdev_tiering_capacity_read_child_done,
+            //                             tiering_map));
 
-            }
+            
 
             READ_DONE:
 
@@ -2430,7 +4116,7 @@ vdev_tiering_io_start(zio_t *zio) {
         case ZIO_TYPE_WRITE: {
 
            vdev_dbgmsg(zio->io_vd, "vdev_tiering_io_start write op txg: %d offset: %llu length: %llu flags: %d",
-                    zio->io_txg, zio->io_offset, zio->io_size, zio->io_flags);
+                       zio->io_txg, zio->io_offset, zio->io_size, zio->io_flags);
 
            /* TODO this is only the base case of a write, need to handle more
             * complex cases like reslivering and scrubs */
@@ -2449,16 +4135,16 @@ vdev_tiering_io_start(zio_t *zio) {
 
 
            /* TODO transfer ownership to here */
-           data_range = data_range_create(tiering_map, zio->io_offset,
-                                          zio->io_size, -1, zio->io_size,
-                                          tiering_map->perf_tier_alloc_tracker);
+        //    data_range = data_range_create(tiering_map, zio->io_offset,
+        //                                   zio->io_size, -1, zio->io_size,
+        //                                   tiering_map->perf_tier_alloc_tracker);
 
 
-           zfs_refcount_transfer_ownership(&data_range->refcount, data_range_create, FTAG);
+        //    zfs_refcount_transfer_ownership(&data_range->refcount, data_range_create, FTAG);
 
 
             // data_range->databuf = zio->io_abd;
-            data_range->orig_zio = zio;
+            // data_range->orig_zio = zio;
 
 //
 
@@ -2523,48 +4209,68 @@ vdev_tiering_io_start(zio_t *zio) {
 
            
 
-            struct write_op_data write_op_data;
+            // struct write_op_data write_op_data;
 
-            mutex_init(&write_op_data.lock, NULL, MUTEX_DEFAULT, NULL);
-            cv_init(&write_op_data.cv, NULL, CV_DEFAULT, NULL);
+            // mutex_init(&write_op_data.lock, NULL, MUTEX_DEFAULT, NULL);
+            // cv_init(&write_op_data.cv, NULL, CV_DEFAULT, NULL);
 
-            write_op_data.data_range = data_range;
-            write_op_data.buf = abd_to_buf(zio->io_abd);
-
-
-            zfs_refcount_add(&data_range->refcount, &write_op_data);
+            // //write_op_data.data_range = data_range;
+            // write_op_data.buf = abd_to_buf(zio->io_abd);
+            // write_op_data.txg = zio->io_txg;
 
 
-            mutex_enter(&write_op_data.lock);
+            //zfs_refcount_add(&data_range->refcount, &write_op_data);
 
-            data_range->perf_offset = zio->io_offset;
+
+            // mutex_enter(&write_op_data.lock);
+
+            // data_range->perf_offset = zio->io_offset;
 
             int rc = 0;
 
-            do {
-                /*zio_t *perf_zio*/
-                int rc = tiering_map->perf_tier->write(tiering_map->perf_tier,
-                                                    /*data_range->databuf*/write_op_data.buf,
-                                                    zio->io_offset,
-                                                    data_range->perf_size,
-                                                    vdev_tiering_performance_write_child_done,
-                                                    &write_op_data);
+            struct cap_info *cap_info = 
+                kmem_alloc(sizeof(struct cap_info), KM_SLEEP);
 
-                /* Evaluate the initial result of the write */
+            cap_info->orig_blkptr = *zio->io_bp;
+
+            do {
+                vdev_dbgmsg(zio->io_vd, "vdev_tiering_io_start write op on performance tier txg: %d offset: %llu length: %llu flags: %d",
+                       zio->io_txg, zio->io_offset, zio->io_size, zio->io_flags);
+
+                /*zio_t *perf_zio*/
+                rc = tiering_map->perf_tier->write(tiering_map->perf_tier,
+                                                    /*data_range->databuf*/
+                                                    zio->io_abd,
+                                                    B_TRUE,
+                                                    zio->io_txg,
+                                                    zio->io_offset,
+                                                    /*data_range->perf_size*/zio->io_size,
+                                                    zio,
+                                                    cap_info,
+                                                    sizeof(*cap_info)/*,
+                                                    vdev_tiering_performance_write_child_done,
+                                                    &write_op_data*/);
+
+                /* Evaluate  the initial result of the write */
                 switch(rc) {
                     
-                    /* Success so wait on signal from handler */
+                    /* Success on scheduling the write so proceed */
                     case 0:
-                        cv_wait(&write_op_data.cv, &write_op_data.lock);
+                        //cv_wait(&write_op_data.cv, &write_op_data.lock);
                         break;
 
                     /* Out of space error, so free some */
                     case ENOSPC:
-                        performance_tier_alloc_tracker_evict_blocks(
-                            tiering_map->perf_tier_alloc_tracker,
-                            tiering_map->perf_tier,
-                            data_range->perf_size,
-                            &data_range->num_evict_rounds);
+                        
+                        // performance_tier_alloc_tracker_evict_blocks(
+                        //     tiering_map->perf_tier_alloc_tracker,
+                        //     tiering_map->perf_tier,
+                        //     data_range->perf_size,
+                        //     &data_range->num_evict_rounds);
+
+                        tiering_map->perf_tier->evict(tiering_map->perf_tier, 
+                                                      zio->io_size);
+                        //ASSERT(0 != 0);
 
                         break;
 
@@ -2577,40 +4283,43 @@ vdev_tiering_io_start(zio_t *zio) {
 
             } while(rc != 0);
             
+            
+
+            /* TODO can skip this is this is not an allocating zio operation */
             /* Create a child vdev io that only allocates on the capacity tier */
-            zio_t *cap_zio = zio_vdev_child_io(zio,
-                                               zio->io_bp,
-                                               tiering_map->capacity_vdev,
-                                               zio->io_offset,
-                                               NULL, //zio->io_abd,
-                                               zio->io_size,
-                                               zio->io_type,
-                                               zio->io_priority,
-                                               ZIO_FLAG_NODATA,
-                                               vdev_tiering_capacity_allocate_child_done,
-                                               data_range);
+            // zio_t *cap_zio = zio_vdev_child_io(zio,
+            //                                    zio->io_bp,
+            //                                    tiering_map->capacity_vdev,
+            //                                    zio->io_offset,
+            //                                    NULL, //zio->io_abd,
+            //                                    zio->io_size,
+            //                                    zio->io_type,
+            //                                    zio->io_priority,
+            //                                    zio->io_flags|ZIO_FLAG_NODATA,
+            //                                    vdev_tiering_capacity_allocate_child_done,
+            //                                    cap_info);
 
-            zfs_refcount_transfer_ownership(&data_range->refcount, FTAG, cap_zio);
+            if(zio->io_flags & ZIO_FLAG_IO_ALLOCATING) {
+                tiering_map->cap_tier->allocate_space(tiering_map->cap_tier, 
+                                                    zio->io_offset, 
+                                                    zio->io_size, zio);
+            }
+            
+            // zfs_refcount_transfer_ownership(&data_range->refcount, FTAG, cap_zio);
 
-            zio_nowait(cap_zio);
+            //zio_nowait(cap_zio);
 
             WRITE_DONE:
                 
-                mutex_exit(&write_op_data.lock);
+                // mutex_exit(&write_op_data.lock);
 
-                mutex_destroy(&write_op_data.lock);
-                cv_destroy(&write_op_data.cv);
+                // mutex_destroy(&write_op_data.lock);
+                // cv_destroy(&write_op_data.cv);
 
-                ASSERT(zfs_refcount_count(&data_range->refcount) > 1);
-                
-                struct perf_tier_alloc_tracker *perf_tier_alloc_tracker = 
-                        data_range->perf_tier_alloc_tracker;
-                zfs_refcount_remove(&data_range->refcount, &write_op_data);
-                data_range_reference_change(perf_tier_alloc_tracker);
+                kmem_free(cap_info, sizeof(*cap_info));
 
                 /* Execute zio */ 
                 zio_execute(zio);
-
                 
             break;
         }
