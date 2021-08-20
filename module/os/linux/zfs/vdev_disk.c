@@ -494,7 +494,11 @@ vdev_blkg_tryget(struct blkcg_gq *blkg)
 static inline void
 vdev_bio_associate_blkg(struct bio *bio)
 {
+#if defined(HAVE_BIO_BDEV_DISK)
+	struct request_queue *q = bio->bi_bdev->bd_disk->queue;
+#else
 	struct request_queue *q = bio->bi_disk->queue;
+#endif
 
 	ASSERT3P(q, !=, NULL);
 	ASSERT3P(bio->bi_blkg, ==, NULL);
@@ -542,7 +546,9 @@ __vdev_disk_physio(struct block_device *bdev, zio_t *zio,
 	if (io_offset + io_size > bdev->bd_inode->i_size) {
 		vdev_dbgmsg(zio->io_vd,
 		    "Illegal access %llu size %llu, device size %llu",
-		    io_offset, io_size, i_size_read(bdev->bd_inode));
+		    (u_longlong_t)io_offset,
+		    (u_longlong_t)io_size,
+		    (u_longlong_t)i_size_read(bdev->bd_inode));
 		return (SET_ERROR(EIO));
 	}
 
@@ -585,9 +591,14 @@ retry:
 		}
 
 		/* bio_alloc() with __GFP_WAIT never returns NULL */
+#ifdef HAVE_BIO_MAX_SEGS
+		dr->dr_bio[i] = bio_alloc(GFP_NOIO, bio_max_segs(
+		    abd_nr_pages_off(zio->io_abd, bio_size, abd_offset)));
+#else
 		dr->dr_bio[i] = bio_alloc(GFP_NOIO,
 		    MIN(abd_nr_pages_off(zio->io_abd, bio_size, abd_offset),
 		    BIO_MAX_PAGES));
+#endif
 		if (unlikely(dr->dr_bio[i] == NULL)) {
 			vdev_disk_dio_free(dr);
 			return (SET_ERROR(ENOMEM));

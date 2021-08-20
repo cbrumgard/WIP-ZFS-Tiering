@@ -1033,8 +1033,8 @@ spa_ld_log_sm_metadata(spa_t *spa)
 		if (sls == NULL) {
 			spa_load_failed(spa, "spa_ld_log_sm_metadata(): bug "
 			    "encountered: could not find log spacemap for "
-			    "TXG %ld [error %d]",
-			    metaslab_unflushed_txg(m), ENOENT);
+			    "TXG %llu [error %d]",
+			    (u_longlong_t)metaslab_unflushed_txg(m), ENOENT);
 			return (ENOENT);
 		}
 		sls->sls_mscount++;
@@ -1290,7 +1290,7 @@ ZFS_MODULE_PARAM(zfs, zfs_, unflushed_max_mem_amt, ULONG, ZMOD_RW,
 ZFS_MODULE_PARAM(zfs, zfs_, unflushed_max_mem_ppm, ULONG, ZMOD_RW,
     "Percentage of the overall system memory that ZFS allows to be "
     "used for unflushed changes (value is calculated over 1000000 for "
-    "finer granularity");
+    "finer granularity)");
 
 ZFS_MODULE_PARAM(zfs, zfs_, unflushed_log_block_max, ULONG, ZMOD_RW,
     "Hard limit (upper-bound) in the size of the space map log "

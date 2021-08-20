@@ -420,7 +420,7 @@ zvol_geom_destroy(zvol_state_t *zv)
 	g_topology_assert();
 
 	mutex_enter(&zv->zv_state_lock);
-	VERIFY(zsg->zsg_state == ZVOL_GEOM_RUNNING);
+	VERIFY3S(zsg->zsg_state, ==, ZVOL_GEOM_RUNNING);
 	mutex_exit(&zv->zv_state_lock);
 	zsg->zsg_provider = NULL;
 	g_wither_geom(pp->geom, ENXIO);
@@ -761,12 +761,13 @@ zvol_cdev_read(struct cdev *dev, struct uio *uio_s, int ioflag)
 	volsize = zv->zv_volsize;
 	/*
 	 * uio_loffset == volsize isn't an error as
-	 * its required for EOF processing.
+	 * it's required for EOF processing.
 	 */
 	if (zfs_uio_resid(&uio) > 0 &&
 	    (zfs_uio_offset(&uio) < 0 || zfs_uio_offset(&uio) > volsize))
 		return (SET_ERROR(EIO));
 
+	ssize_t start_resid = zfs_uio_resid(&uio);
 	lr = zfs_rangelock_enter(&zv->zv_rangelock, zfs_uio_offset(&uio),
 	    zfs_uio_resid(&uio), RL_READER);
 	while (zfs_uio_resid(&uio) > 0 && zfs_uio_offset(&uio) < volsize) {
@@ -785,6 +786,8 @@ zvol_cdev_read(struct cdev *dev, struct uio *uio_s, int ioflag)
 		}
 	}
 	zfs_rangelock_exit(lr);
+	int64_t nread = start_resid - zfs_uio_resid(&uio);
+	dataset_kstats_update_read_kstats(&zv->zv_kstat, nread);
 
 	return (error);
 }
@@ -809,6 +812,7 @@ zvol_cdev_write(struct cdev *dev, struct uio *uio_s, int ioflag)
 	    (zfs_uio_offset(&uio) < 0 || zfs_uio_offset(&uio) > volsize))
 		return (SET_ERROR(EIO));
 
+	ssize_t start_resid = zfs_uio_resid(&uio);
 	sync = (ioflag & IO_SYNC) ||
 	    (zv->zv_objset->os_sync == ZFS_SYNC_ALWAYS);
 
@@ -840,6 +844,8 @@ zvol_cdev_write(struct cdev *dev, struct uio *uio_s, int ioflag)
 			break;
 	}
 	zfs_rangelock_exit(lr);
+	int64_t nwritten = start_resid - zfs_uio_resid(&uio);
+	dataset_kstats_update_write_kstats(&zv->zv_kstat, nwritten);
 	if (sync)
 		zil_commit(zv->zv_zilog, ZVOL_OBJ);
 	rw_exit(&zv->zv_suspend_lock);
@@ -1163,6 +1169,9 @@ zvol_ensure_zilog(zvol_state_t *zv)
 			zv->zv_zilog = zil_open(zv->zv_objset,
 			    zvol_get_data);
 			zv->zv_flags |= ZVOL_WRITTEN_TO;
+			/* replay / destroy done in zvol_create_minor_impl() */
+			VERIFY0(zv->zv_zilog->zl_header->zh_flags &
+			    ZIL_REPLAY_NEEDED);
 		}
 		rw_downgrade(&zv->zv_suspend_lock);
 	}
@@ -1232,7 +1241,11 @@ zvol_rename_minor(zvol_state_t *zv, const char *newname)
 		args.mda_si_drv2 = zv;
 		if (make_dev_s(&args, &dev, "%s/%s", ZVOL_DRIVER, newname)
 		    == 0) {
+#if __FreeBSD_version > 1300130
+			dev->si_iosize_max = maxphys;
+#else
 			dev->si_iosize_max = MAXPHYS;
+#endif
 			zsd->zsd_cdev = dev;
 		}
 	}
@@ -1268,9 +1281,10 @@ zvol_free(zvol_state_t *zv)
 		struct zvol_state_dev *zsd = &zv->zv_zso->zso_dev;
 		struct cdev *dev = zsd->zsd_cdev;
 
-		ASSERT3P(dev->si_drv2, ==, NULL);
-
-		destroy_dev(dev);
+		if (dev != NULL) {
+			ASSERT3P(dev->si_drv2, ==, NULL);
+			destroy_dev(dev);
+		}
 	}
 
 	mutex_destroy(&zv->zv_state_lock);
@@ -1365,16 +1379,15 @@ zvol_create_minor_impl(const char *name)
 		args.mda_gid = GID_OPERATOR;
 		args.mda_mode = 0640;
 		args.mda_si_drv2 = zv;
-		error = make_dev_s(&args, &dev, "%s/%s", ZVOL_DRIVER, name);
-		if (error) {
-			kmem_free(zv->zv_zso, sizeof (struct zvol_state_os));
-			mutex_destroy(&zv->zv_state_lock);
-			kmem_free(zv, sizeof (*zv));
-			dmu_objset_disown(os, B_TRUE, FTAG);
-			goto out_doi;
+		if (make_dev_s(&args, &dev, "%s/%s", ZVOL_DRIVER, name)
+		    == 0) {
+#if __FreeBSD_version > 1300130
+			dev->si_iosize_max = maxphys;
+#else
+			dev->si_iosize_max = MAXPHYS;
+#endif
+			zsd->zsd_cdev = dev;
 		}
-		dev->si_iosize_max = MAXPHYS;
-		zsd->zsd_cdev = dev;
 	}
 	(void) strlcpy(zv->zv_name, name, MAXPATHLEN);
 	rw_init(&zv->zv_suspend_lock, NULL, RW_DEFAULT, NULL);
@@ -1387,12 +1400,16 @@ zvol_create_minor_impl(const char *name)
 	zv->zv_volsize = volsize;
 	zv->zv_objset = os;
 
+	ASSERT3P(zv->zv_zilog, ==, NULL);
+	zv->zv_zilog = zil_open(os, zvol_get_data);
 	if (spa_writeable(dmu_objset_spa(os))) {
 		if (zil_replay_disable)
-			zil_destroy(dmu_objset_zil(os), B_FALSE);
+			zil_destroy(zv->zv_zilog, B_FALSE);
 		else
 			zil_replay(os, zv, zvol_replay_vector);
 	}
+	zil_close(zv->zv_zilog);
+	zv->zv_zilog = NULL;
 	ASSERT3P(zv->zv_kstat.dk_kstats, ==, NULL);
 	dataset_kstats_create(&zv->zv_kstat, zv->zv_objset);
 
@@ -1443,7 +1460,8 @@ zvol_clear_private(zvol_state_t *zv)
 		struct zvol_state_dev *zsd = &zv->zv_zso->zso_dev;
 		struct cdev *dev = zsd->zsd_cdev;
 
-		dev->si_drv2 = NULL;
+		if (dev != NULL)
+			dev->si_drv2 = NULL;
 	}
 }
 

@@ -79,7 +79,6 @@ zfs_log_create_txtype(zil_create_t type, vsecattr_t *vsecp, vattr_t *vap)
 			return (TX_CREATE_ACL);
 		else
 			return (TX_CREATE_ATTR);
-		/*NOTREACHED*/
 	case Z_DIR:
 		if (vsecp == NULL && !isxvattr)
 			return (TX_MKDIR);
@@ -126,9 +125,11 @@ zfs_log_xvattr(lr_attr_t *lrattr, xvattr_t *xvap)
 
 	/* Now pack the attributes up in a single uint64_t */
 	attrs = (uint64_t *)bitmap;
-	crtime = attrs + 1;
-	scanstamp = (caddr_t)(crtime + 2);
 	*attrs = 0;
+	crtime = attrs + 1;
+	bzero(crtime, 2 * sizeof (uint64_t));
+	scanstamp = (caddr_t)(crtime + 2);
+	bzero(scanstamp, AV_SCANSTAMP_SZ);
 	if (XVA_ISSET_REQ(xvap, XAT_READONLY))
 		*attrs |= (xoap->xoa_readonly == 0) ? 0 :
 		    XAT0_READONLY;
@@ -540,6 +541,8 @@ zfs_log_write(zilog_t *zilog, dmu_tx_t *tx, int txtype,
 	uint32_t blocksize = zp->z_blksz;
 	itx_wr_state_t write_state;
 	uintptr_t fsync_cnt;
+	uint64_t gen = 0;
+	ssize_t size = resid;
 
 	if (zil_replaying(zilog, tx) || zp->z_unlinked ||
 	    zfs_xattr_owner_unlinked(zp)) {
@@ -561,6 +564,9 @@ zfs_log_write(zilog_t *zilog, dmu_tx_t *tx, int txtype,
 	if ((fsync_cnt = (uintptr_t)tsd_get(zfs_fsyncer_key)) != 0) {
 		(void) tsd_set(zfs_fsyncer_key, (void *)(fsync_cnt - 1));
 	}
+
+	(void) sa_lookup(zp->z_sa_hdl, SA_ZPL_GEN(ZTOZSB(zp)), &gen,
+	    sizeof (gen));
 
 	while (resid) {
 		itx_t *itx;
@@ -609,6 +615,7 @@ zfs_log_write(zilog_t *zilog, dmu_tx_t *tx, int txtype,
 		BP_ZERO(&lr->lr_blkptr);
 
 		itx->itx_private = ZTOZSB(zp);
+		itx->itx_gen = gen;
 
 		if (!(ioflag & (O_SYNC | O_DSYNC)) && (zp->z_sync_cnt == 0) &&
 		    (fsync_cnt == 0))
@@ -620,6 +627,10 @@ zfs_log_write(zilog_t *zilog, dmu_tx_t *tx, int txtype,
 
 		off += len;
 		resid -= len;
+	}
+
+	if (write_state == WR_COPIED || write_state == WR_NEED_COPY) {
+		dsl_pool_wrlog_count(zilog->zl_dmu_pool, size, tx->tx_txg);
 	}
 }
 

@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <libzutil.h>
 #include <sys/crypto/icp.h>
 #include <sys/processor.h>
 #include <sys/rrwlock.h>
@@ -144,36 +145,6 @@ kstat_install(kstat_t *ksp)
 /*ARGSUSED*/
 void
 kstat_delete(kstat_t *ksp)
-{}
-
-/*ARGSUSED*/
-void
-kstat_waitq_enter(kstat_io_t *kiop)
-{}
-
-/*ARGSUSED*/
-void
-kstat_waitq_exit(kstat_io_t *kiop)
-{}
-
-/*ARGSUSED*/
-void
-kstat_runq_enter(kstat_io_t *kiop)
-{}
-
-/*ARGSUSED*/
-void
-kstat_runq_exit(kstat_io_t *kiop)
-{}
-
-/*ARGSUSED*/
-void
-kstat_waitq_to_runq(kstat_io_t *kiop)
-{}
-
-/*ARGSUSED*/
-void
-kstat_runq_back_to_waitq(kstat_io_t *kiop)
 {}
 
 void
@@ -571,19 +542,10 @@ void
 __dprintf(boolean_t dprint, const char *file, const char *func,
     int line, const char *fmt, ...)
 {
-	const char *newfile;
+	/* Get rid of annoying "../common/" prefix to filename. */
+	const char *newfile = zfs_basename(file);
+
 	va_list adx;
-
-	/*
-	 * Get rid of annoying "../common/" prefix to filename.
-	 */
-	newfile = strrchr(file, '/');
-	if (newfile != NULL) {
-		newfile = newfile + 1; /* Get rid of leading / */
-	} else {
-		newfile = file;
-	}
-
 	if (dprint) {
 		/* dprintf messages are printed immediately */
 
@@ -672,7 +634,6 @@ vcmn_err(int ce, const char *fmt, va_list adx)
 	}
 }
 
-/*PRINTFLIKE2*/
 void
 cmn_err(int ce, const char *fmt, ...)
 {
@@ -723,15 +684,15 @@ lowbit64(uint64_t i)
 	return (__builtin_ffsll(i));
 }
 
-char *random_path = "/dev/random";
-char *urandom_path = "/dev/urandom";
+const char *random_path = "/dev/random";
+const char *urandom_path = "/dev/urandom";
 static int random_fd = -1, urandom_fd = -1;
 
 void
 random_init(void)
 {
-	VERIFY((random_fd = open(random_path, O_RDONLY)) != -1);
-	VERIFY((urandom_fd = open(urandom_path, O_RDONLY)) != -1);
+	VERIFY((random_fd = open(random_path, O_RDONLY | O_CLOEXEC)) != -1);
+	VERIFY((urandom_fd = open(urandom_path, O_RDONLY | O_CLOEXEC)) != -1);
 }
 
 void
@@ -826,7 +787,7 @@ kernel_init(int mode)
 
 	physmem = sysconf(_SC_PHYS_PAGES);
 
-	dprintf("physmem = %llu pages (%.2f GB)\n", physmem,
+	dprintf("physmem = %llu pages (%.2f GB)\n", (u_longlong_t)physmem,
 	    (double)physmem * sysconf(_SC_PAGE_SIZE) / (1ULL << 30));
 
 	(void) snprintf(hw_serial, sizeof (hw_serial), "%ld",
@@ -966,16 +927,16 @@ kmem_asprintf(const char *fmt, ...)
 }
 
 /* ARGSUSED */
-int
+zfs_file_t *
 zfs_onexit_fd_hold(int fd, minor_t *minorp)
 {
 	*minorp = 0;
-	return (0);
+	return (NULL);
 }
 
 /* ARGSUSED */
 void
-zfs_onexit_fd_rele(int fd)
+zfs_onexit_fd_rele(zfs_file_t *fp)
 {
 }
 
@@ -1070,7 +1031,7 @@ zfs_file_open(const char *path, int flags, int mode, zfs_file_t **fpp)
 
 	if (vn_dumpdir != NULL) {
 		char *dumppath = umem_zalloc(MAXPATHLEN, UMEM_NOFAIL);
-		char *inpath = basename((char *)(uintptr_t)path);
+		const char *inpath = zfs_basename(path);
 
 		(void) snprintf(dumppath, MAXPATHLEN,
 		    "%s/%s", vn_dumpdir, inpath);
@@ -1385,28 +1346,26 @@ zfs_file_unlink(const char *path)
  * Get reference to file pointer
  *
  * fd - input file descriptor
- * fpp - pointer to file pointer
  *
- * Returns 0 on success EBADF on failure.
+ * Returns pointer to file struct or NULL.
  * Unsupported in user space.
  */
-int
-zfs_file_get(int fd, zfs_file_t **fpp)
+zfs_file_t *
+zfs_file_get(int fd)
 {
 	abort();
 
-	return (EOPNOTSUPP);
+	return (NULL);
 }
-
 /*
  * Drop reference to file pointer
  *
- * fd - input file descriptor
+ * fp - pointer to file struct
  *
  * Unsupported in user space.
  */
 void
-zfs_file_put(int fd)
+zfs_file_put(zfs_file_t *fp)
 {
 	abort();
 }

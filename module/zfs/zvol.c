@@ -84,9 +84,7 @@
 #include <sys/zfs_rlock.h>
 #include <sys/spa_impl.h>
 #include <sys/zvol.h>
-
 #include <sys/zvol_impl.h>
-
 
 unsigned int zvol_inhibit_dev = 0;
 unsigned int zvol_volmode = ZFS_VOLMODE_GEOM;
@@ -106,10 +104,8 @@ typedef enum {
 
 typedef struct {
 	zvol_async_op_t op;
-	char pool[MAXNAMELEN];
 	char name1[MAXNAMELEN];
 	char name2[MAXNAMELEN];
-	zprop_source_t source;
 	uint64_t value;
 } zvol_task_t;
 
@@ -473,7 +469,19 @@ zvol_replay_truncate(void *arg1, void *arg2, boolean_t byteswap)
 	offset = lr->lr_offset;
 	length = lr->lr_length;
 
-	return (dmu_free_long_range(zv->zv_objset, ZVOL_OBJ, offset, length));
+	dmu_tx_t *tx = dmu_tx_create(zv->zv_objset);
+	dmu_tx_mark_netfree(tx);
+	int error = dmu_tx_assign(tx, TXG_WAIT);
+	if (error != 0) {
+		dmu_tx_abort(tx);
+	} else {
+		zil_replaying(zv->zv_zilog, tx);
+		dmu_tx_commit(tx);
+		error = dmu_free_long_range(zv->zv_objset, ZVOL_OBJ, offset,
+		    length);
+	}
+
+	return (error);
 }
 
 /*
@@ -513,6 +521,7 @@ zvol_replay_write(void *arg1, void *arg2, boolean_t byteswap)
 		dmu_tx_abort(tx);
 	} else {
 		dmu_write(os, ZVOL_OBJ, offset, length, data, tx);
+		zil_replaying(zv->zv_zilog, tx);
 		dmu_tx_commit(tx);
 	}
 
@@ -566,6 +575,7 @@ zvol_log_write(zvol_state_t *zv, dmu_tx_t *tx, uint64_t offset,
 	uint32_t blocksize = zv->zv_volblocksize;
 	zilog_t *zilog = zv->zv_zilog;
 	itx_wr_state_t write_state;
+	uint64_t sz = size;
 
 	if (zil_replaying(zilog, tx))
 		return;
@@ -617,6 +627,10 @@ zvol_log_write(zvol_state_t *zv, dmu_tx_t *tx, uint64_t offset,
 		offset += len;
 		size -= len;
 	}
+
+	if (write_state == WR_COPIED || write_state == WR_NEED_COPY) {
+		dsl_pool_wrlog_count(zilog->zl_dmu_pool, sz, tx->tx_txg);
+	}
 }
 
 /*
@@ -660,7 +674,8 @@ zvol_get_done(zgd_t *zgd, int error)
  * Get data to generate a TX_WRITE intent log record.
  */
 int
-zvol_get_data(void *arg, lr_write_t *lr, char *buf, struct lwb *lwb, zio_t *zio)
+zvol_get_data(void *arg, uint64_t arg2, lr_write_t *lr, char *buf,
+    struct lwb *lwb, zio_t *zio)
 {
 	zvol_state_t *zv = arg;
 	uint64_t offset = lr->lr_offset;
@@ -1183,6 +1198,12 @@ zvol_create_minor(const char *name)
  * Remove minors for specified dataset including children and snapshots.
  */
 
+static void
+zvol_free_task(void *arg)
+{
+	ops->zv_free(arg);
+}
+
 void
 zvol_remove_minors_impl(const char *name)
 {
@@ -1231,8 +1252,8 @@ zvol_remove_minors_impl(const char *name)
 			mutex_exit(&zv->zv_state_lock);
 
 			/* Try parallel zv_free, if failed do it in place */
-			t = taskq_dispatch(system_taskq,
-			    (task_func_t *)ops->zv_free, zv, TQ_SLEEP);
+			t = taskq_dispatch(system_taskq, zvol_free_task, zv,
+			    TQ_SLEEP);
 			if (t == TASKQID_INVALID)
 				list_insert_head(&free_list, zv);
 		} else {
@@ -1369,10 +1390,6 @@ zvol_set_snapdev_impl(char *name, uint64_t snapdev)
 	spl_fstrans_unmark(cookie);
 }
 
-typedef struct zvol_volmode_cb_arg {
-	uint64_t volmode;
-} zvol_volmode_cb_arg_t;
-
 static void
 zvol_set_volmode_impl(char *name, uint64_t volmode)
 {
@@ -1425,7 +1442,6 @@ zvol_task_alloc(zvol_async_op_t op, const char *name1, const char *name2,
     uint64_t value)
 {
 	zvol_task_t *task;
-	char *delim;
 
 	/* Never allow tasks on hidden names. */
 	if (name1[0] == '$')
@@ -1434,8 +1450,6 @@ zvol_task_alloc(zvol_async_op_t op, const char *name1, const char *name2,
 	task = kmem_zalloc(sizeof (zvol_task_t), KM_SLEEP);
 	task->op = op;
 	task->value = value;
-	delim = strchr(name1, '/');
-	strlcpy(task->pool, name1, delim ? (delim - name1 + 1) : MAXNAMELEN);
 
 	strlcpy(task->name1, name1, MAXNAMELEN);
 	if (name2 != NULL)

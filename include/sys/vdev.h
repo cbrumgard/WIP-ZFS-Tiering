@@ -52,7 +52,8 @@ extern int zfs_nocacheflush;
 
 typedef boolean_t vdev_open_children_func_t(vdev_t *vd);
 
-extern void vdev_dbgmsg(vdev_t *vd, const char *fmt, ...);
+extern void vdev_dbgmsg(vdev_t *vd, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
 extern void vdev_dbgmsg_print_tree(vdev_t *, int);
 extern int vdev_open(vdev_t *);
 extern void vdev_open_children(vdev_t *);
@@ -132,6 +133,15 @@ extern void vdev_space_update(vdev_t *vd,
 extern int64_t vdev_deflated_space(vdev_t *vd, int64_t space);
 
 extern uint64_t vdev_psize_to_asize(vdev_t *vd, uint64_t psize);
+
+/*
+ * Return the amount of space allocated for a gang block header.
+ */
+static inline uint64_t
+vdev_gang_header_asize(vdev_t *vd)
+{
+	return (vdev_psize_to_asize(vd, SPA_GANGBLOCKSIZE));
+}
 
 extern int vdev_fault(spa_t *spa, uint64_t guid, vdev_aux_t aux);
 extern int vdev_degrade(spa_t *spa, uint64_t guid, vdev_aux_t aux);

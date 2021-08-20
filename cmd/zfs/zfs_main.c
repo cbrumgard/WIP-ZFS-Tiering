@@ -52,8 +52,9 @@
 #include <zone.h>
 #include <grp.h>
 #include <pwd.h>
+#include <umem.h>
+#include <pthread.h>
 #include <signal.h>
-#include <sys/debug.h>
 #include <sys/list.h>
 #include <sys/mkdev.h>
 #include <sys/mntent.h>
@@ -71,7 +72,6 @@
 #include <zfs_prop.h>
 #include <zfs_deleg.h>
 #include <libzutil.h>
-#include <libuutil.h>
 #ifdef HAVE_IDMAP
 #include <aclutils.h>
 #include <directory.h>
@@ -80,12 +80,10 @@
 #include "zfs_iter.h"
 #include "zfs_util.h"
 #include "zfs_comutil.h"
-#include "libzfs_impl.h"
 #include "zfs_projectutil.h"
 
 libzfs_handle_t *g_zfs;
 
-static FILE *mnttab_file;
 static char history_str[HIS_MAX_RECORD_LEN];
 static boolean_t log_history = B_TRUE;
 
@@ -319,7 +317,7 @@ get_usage(zfs_help_t idx)
 	case HELP_SEND:
 		return (gettext("\tsend [-DnPpRvLecwhb] [-[i|I] snapshot] "
 		    "<snapshot>\n"
-		    "\tsend [-nvPLecw] [-i snapshot|bookmark] "
+		    "\tsend [-DnvPLecw] [-i snapshot|bookmark] "
 		    "<filesystem|volume|snapshot>\n"
 		    "\tsend [-DnPpvLec] [-i bookmark|snapshot] "
 		    "--redact <bookmark> <snapshot>\n"
@@ -416,10 +414,9 @@ get_usage(zfs_help_t idx)
 		return (gettext("\tunjail <jailid|jailname> <filesystem>\n"));
 	case HELP_WAIT:
 		return (gettext("\twait [-t <activity>] <filesystem>\n"));
+	default:
+		__builtin_unreachable();
 	}
-
-	abort();
-	/* NOTREACHED */
 }
 
 void
@@ -728,6 +725,32 @@ finish_progress(char *done)
 	}
 	free(pt_header);
 	pt_header = NULL;
+}
+
+/* This function checks if the passed fd refers to /dev/null or /dev/zero */
+#ifdef __linux__
+static boolean_t
+is_dev_nullzero(int fd)
+{
+	struct stat st;
+	fstat(fd, &st);
+	return (major(st.st_rdev) == 1 && (minor(st.st_rdev) == 3 /* null */ ||
+	    minor(st.st_rdev) == 5 /* zero */));
+}
+#endif
+
+static void
+note_dev_error(int err, int fd)
+{
+#ifdef __linux__
+	if (err == EINVAL && is_dev_nullzero(fd)) {
+		(void) fprintf(stderr,
+		    gettext("Error: Writing directly to /dev/{null,zero} files"
+		    " on certain kernels is not currently implemented.\n"
+		    "(As a workaround, "
+		    "try \"zfs send [...] | cat > /dev/null\")\n"));
+	}
+#endif
 }
 
 static int
@@ -3318,7 +3341,7 @@ zfs_do_userspace(int argc, char **argv)
 	if ((zhp = zfs_path_to_zhandle(g_zfs, argv[0], ZFS_TYPE_FILESYSTEM |
 	    ZFS_TYPE_SNAPSHOT)) == NULL)
 		return (1);
-	if (zhp->zfs_head_type != ZFS_TYPE_FILESYSTEM) {
+	if (zfs_get_underlying_type(zhp) != ZFS_TYPE_FILESYSTEM) {
 		(void) fprintf(stderr, gettext("operation is only applicable "
 		    "to filesystems and their snapshots\n"));
 		zfs_close(zhp);
@@ -4378,6 +4401,7 @@ zfs_do_send(int argc, char **argv)
 
 	struct option long_options[] = {
 		{"replicate",	no_argument,		NULL, 'R'},
+		{"skip-missing",	no_argument,		NULL, 's'},
 		{"redact",	required_argument,	NULL, 'd'},
 		{"props",	no_argument,		NULL, 'p'},
 		{"parsable",	no_argument,		NULL, 'P'},
@@ -4396,7 +4420,7 @@ zfs_do_send(int argc, char **argv)
 	};
 
 	/* check options */
-	while ((c = getopt_long(argc, argv, ":i:I:RDpvnPLeht:cwbd:S",
+	while ((c = getopt_long(argc, argv, ":i:I:RsDpvnPLeht:cwbd:S",
 	    long_options, NULL)) != -1) {
 		switch (c) {
 		case 'i':
@@ -4412,6 +4436,9 @@ zfs_do_send(int argc, char **argv)
 			break;
 		case 'R':
 			flags.replicate = B_TRUE;
+			break;
+		case 's':
+			flags.skipmissing = B_TRUE;
 			break;
 		case 'd':
 			redactbook = optarg;
@@ -4483,7 +4510,6 @@ zfs_do_send(int argc, char **argv)
 			usage(B_FALSE);
 			break;
 		case '?':
-			/*FALLTHROUGH*/
 		default:
 			/*
 			 * If an invalid flag was passed, optopt contains the
@@ -4570,11 +4596,23 @@ zfs_do_send(int argc, char **argv)
 
 		err = zfs_send_saved(zhp, &flags, STDOUT_FILENO,
 		    resume_token);
+		if (err != 0)
+			note_dev_error(errno, STDOUT_FILENO);
 		zfs_close(zhp);
 		return (err != 0);
 	} else if (resume_token != NULL) {
-		return (zfs_send_resume(g_zfs, &flags, STDOUT_FILENO,
-		    resume_token));
+		err = zfs_send_resume(g_zfs, &flags, STDOUT_FILENO,
+		    resume_token);
+		if (err != 0)
+			note_dev_error(errno, STDOUT_FILENO);
+		return (err);
+	}
+
+	if (flags.skipmissing && !flags.replicate) {
+		(void) fprintf(stderr,
+		    gettext("skip-missing flag can only be used in "
+		    "conjunction with replicate\n"));
+		usage(B_FALSE);
 	}
 
 	/*
@@ -4618,6 +4656,8 @@ zfs_do_send(int argc, char **argv)
 		err = zfs_send_one(zhp, fromname, STDOUT_FILENO, &flags,
 		    redactbook);
 		zfs_close(zhp);
+		if (err != 0)
+			note_dev_error(errno, STDOUT_FILENO);
 		return (err != 0);
 	}
 
@@ -4694,6 +4734,7 @@ zfs_do_send(int argc, char **argv)
 		nvlist_free(dbgnv);
 	}
 	zfs_close(zhp);
+	note_dev_error(errno, STDOUT_FILENO);
 
 	return (err != 0);
 }
@@ -7054,8 +7095,7 @@ share_mount(int op, int argc, char **argv)
 		get_all_datasets(&cb, verbose);
 
 		if (cb.cb_used == 0) {
-			if (options != NULL)
-				free(options);
+			free(options);
 			return (0);
 		}
 
@@ -7085,6 +7125,7 @@ share_mount(int op, int argc, char **argv)
 			zfs_close(cb.cb_handles[i]);
 		free(cb.cb_handles);
 	} else if (argc == 0) {
+		FILE *mnttab;
 		struct mnttab entry;
 
 		if ((op == OP_SHARE) || (options != NULL)) {
@@ -7100,14 +7141,12 @@ share_mount(int op, int argc, char **argv)
 		 * automatically.
 		 */
 
-		/* Reopen MNTTAB to prevent reading stale data from open file */
-		if (freopen(MNTTAB, "r", mnttab_file) == NULL) {
-			if (options != NULL)
-				free(options);
+		if ((mnttab = fopen(MNTTAB, "re")) == NULL) {
+			free(options);
 			return (ENOENT);
 		}
 
-		while (getmntent(mnttab_file, &entry) == 0) {
+		while (getmntent(mnttab, &entry) == 0) {
 			if (strcmp(entry.mnt_fstype, MNTTYPE_ZFS) != 0 ||
 			    strchr(entry.mnt_special, '@') != NULL)
 				continue;
@@ -7116,6 +7155,7 @@ share_mount(int op, int argc, char **argv)
 			    entry.mnt_mountp);
 		}
 
+		(void) fclose(mnttab);
 	} else {
 		zfs_handle_t *zhp;
 
@@ -7136,9 +7176,7 @@ share_mount(int op, int argc, char **argv)
 		}
 	}
 
-	if (options != NULL)
-		free(options);
-
+	free(options);
 	return (ret);
 }
 
@@ -7200,10 +7238,6 @@ unshare_unmount_path(int op, char *path, int flags, boolean_t is_manual)
 	/*
 	 * Search for the given (major,minor) pair in the mount table.
 	 */
-
-	/* Reopen MNTTAB to prevent reading stale data from open file */
-	if (freopen(MNTTAB, "r", mnttab_file) == NULL)
-		return (ENOENT);
 
 	if (getextmntent(path, &entry, &statbuf) != 0) {
 		if (op == OP_SHARE) {
@@ -7344,6 +7378,7 @@ unshare_unmount(int op, int argc, char **argv)
 		 * the special type (dataset name), and walk the result in
 		 * reverse to make sure to get any snapshots first.
 		 */
+		FILE *mnttab;
 		struct mnttab entry;
 		uu_avl_pool_t *pool;
 		uu_avl_t *tree = NULL;
@@ -7376,11 +7411,10 @@ unshare_unmount(int op, int argc, char **argv)
 		    ((tree = uu_avl_create(pool, NULL, UU_DEFAULT)) == NULL))
 			nomem();
 
-		/* Reopen MNTTAB to prevent reading stale data from open file */
-		if (freopen(MNTTAB, "r", mnttab_file) == NULL)
+		if ((mnttab = fopen(MNTTAB, "re")) == NULL)
 			return (ENOENT);
 
-		while (getmntent(mnttab_file, &entry) == 0) {
+		while (getmntent(mnttab, &entry) == 0) {
 
 			/* ignore non-ZFS entries */
 			if (strcmp(entry.mnt_fstype, MNTTYPE_ZFS) != 0)
@@ -7450,6 +7484,7 @@ unshare_unmount(int op, int argc, char **argv)
 				free(node);
 			}
 		}
+		(void) fclose(mnttab);
 
 		/*
 		 * Walk the AVL tree in reverse, unmounting each filesystem and
@@ -8639,8 +8674,6 @@ main(int argc, char **argv)
 		(void) fprintf(stderr, "%s\n", libzfs_error_init(errno));
 		return (1);
 	}
-
-	mnttab_file = g_zfs->libzfs_mnttab;
 
 	zfs_save_arguments(argc, argv, history_str, sizeof (history_str));
 
